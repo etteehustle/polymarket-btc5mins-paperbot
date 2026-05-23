@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/*.sqlite
+data/*.sqlite-*
+reports/*.csv
+.env
+.env.*
+
