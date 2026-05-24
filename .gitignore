@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 data/*.sqlite
 data/*.sqlite-*
+data/runs/*.sqlite
+data/runs/*.sqlite-*
 reports/*.csv
+reports/*.log
 .env
 .env.*
-

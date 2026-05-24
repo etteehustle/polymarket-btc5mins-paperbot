@@ -7,11 +7,15 @@ This tool does not use a wallet, private key, API key, or real orders. It polls 
 ## What It Tests
 
 - Directional BTC up/down scalping:
-  - enter when the ask is around `0.65-0.72`
+  - enter when the ask is around `0.65-0.68` by default
+  - for BTC 5-minute `watch-url`, auto-read the market target from Polymarket `eventMetadata.priceToBeat`
+  - risk guards default to one trade per label, market lock after a loss, no entries after 180 seconds, and `ask + opposite ask <= 1.03`
   - exit on take profit, stop loss, hard stop, or late ambiguous BTC/target state
 - Complete-set arbitrage scanner:
-  - logs when `YES ask + NO ask + buffer < 1`
-  - logs when `YES bid + NO bid - buffer > 1`
+  - logs when `YES ask + NO ask + taker fees + buffer < 1`
+  - logs when `YES bid + NO bid - taker fees - buffer > 1`
+  - taker fees follow Polymarket's formula: `shares * fee_rate * price * (1 - price)`
+  - the bot queries `https://clob.polymarket.com/fee-rate?token_id=...` and falls back to `--fee-rate`
 
 ## Quick Start
 
@@ -20,7 +24,7 @@ Paste a Polymarket event URL and let the tool find the outcome token IDs automat
 ```powershell
 python paper_bot.py watch-url `
   "https://polymarket.com/event/btc-updown-5m-1779549600" `
-  --poll 5
+  --poll 2
 ```
 
 This runs:
@@ -30,13 +34,36 @@ This runs:
 - automatic stop at the market end time plus 1 second
 - an automatic report for that market after the watcher stops
 
-If you know a fixed BTC target price and want the late-distance filter, add:
+When started from the dashboard, each run gets a fresh SQLite file under `data/runs/`. The filename includes the UTC start time, market slug, and core strategy settings, and the same metadata is also stored inside the DB in `run_metadata`.
+
+For BTC 5-minute `watch-url`, the bot reads the target price automatically, so you only provide the minimum distance:
 
 ```powershell
---target-price 75000 --min-distance-usd 50
+--min-distance-usd 25
 ```
 
-For BTC up/down 5-minute markets, the official resolution compares Chainlink's end price with the beginning price, so the target is the window's opening price. If you do not provide `--target-price`, the tool still paper-tests from share price/orderbook rules but skips the BTC-distance filter.
+The first source is Gamma `eventMetadata.priceToBeat`. If that field is missing while the Polymarket page already shows the value, the bot falls back to Polymarket `/api/past-results` and then the event page's hydrated price data.
+If all sources are unavailable, the bot waits during lookup and then fails closed instead of silently trading without the distance filter. Use `--min-distance-usd 0` only if you intentionally want to disable the BTC-distance filter.
+
+The optimized default band is:
+
+```powershell
+--entry-min 0.65 --entry-max 0.68 --take-profit 0.88 --stop-loss 0.58 --hard-exit 0.58
+```
+
+Risk guard defaults:
+
+```powershell
+--max-trades-per-label-per-market 1 --market-lock-after-loss --no-entry-after-seconds 180 --max-sum-asks 1.03
+```
+
+Optionally limit entries to the final part of a market:
+
+```powershell
+--entry-window-seconds 120
+```
+
+Use `--entry-window-seconds 0` to disable the remaining-time gate. This is the default so it does not conflict with `--no-entry-after-seconds 180`.
 
 You can override the runtime if needed:
 
@@ -50,7 +77,7 @@ Run several BTC 5-minute markets in a row:
 python paper_bot.py watch-url `
   "https://polymarket.com/event/btc-updown-5m-1779550500" `
   --chain-count 3 `
-  --poll 5
+  --poll 2
 ```
 
 For timestamped BTC 5-minute slugs, the tool adds `300` seconds to the slug for each next market. It waits for each market to end plus 1 second, prints that market's report, moves to the next one, and prints an aggregate summary after the chain finishes.
@@ -64,7 +91,7 @@ python paper_bot.py watch-directional `
   --target-price 75000 `
   --direction UP `
   --seconds 900 `
-  --poll 5
+  --poll 2
 ```
 
 Generate a report:
@@ -115,13 +142,19 @@ python paper_bot.py watch-arb `
   --yes-token-id YES_TOKEN_ID `
   --no-token-id NO_TOKEN_ID `
   --label "BTC 5m complete set" `
+  --fee-rate 0.07 `
   --seconds 900 `
-  --poll 5
+  --poll 2
 ```
+
+The bot queries Polymarket's CLOB `/fee-rate` endpoint for the active token and uses `--fee-rate` only as a fallback.
+`--fee-rate` defaults to `0.07`, matching Polymarket's Crypto taker fee rate at the time this bot was updated.
+Use the current Polymarket fee docs for other categories, for example `0.03` for Sports, `0.04` for Finance/Politics/Tech, `0.05` for Other-style categories, or `0` for fee-free markets.
+`--arb-buffer` / `--buffer` is now only an extra safety margin for slippage after protocol taker fees are included.
 
 ## Notes
 
 - `watch-directional` assumes taker-style paper fills: enter at best ask, exit at best bid.
 - This is conservative for market-taking and still imperfect during fast moves.
 - It does not know whether a maker order would really fill. For that, collect WebSocket orderbook/trade streams later.
-- The default database is `data/paper.sqlite`.
+- Dashboard runs write separate databases under `data/runs/`; direct CLI commands still default to `data/paper.sqlite` unless `--db` is provided.
