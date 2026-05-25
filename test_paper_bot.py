@@ -288,7 +288,11 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual([preset["key"] for preset in config["presets"]], ["safe", "balanced", "aggressive"])
         self.assertTrue(all(preset["enabled"] for preset in config["presets"]))
         self.assertEqual(config["presets"][0]["take_profit"], 0.84)
+        self.assertEqual(config["presets"][0]["min_distance_usd"], 100.0)
+        self.assertEqual(config["presets"][1]["entry_min"], 0.65)
+        self.assertEqual(config["presets"][1]["min_distance_usd"], 75.0)
         self.assertEqual(config["presets"][2]["entry_max"], 0.72)
+        self.assertEqual(config["presets"][2]["min_distance_usd"], 75.0)
 
     def test_dashboard_config_accepts_custom_preset_values(self):
         config = normalize_bot_config(
@@ -382,6 +386,20 @@ class StrategyTests(unittest.TestCase):
         self.assertIn(".terminal .log-target", DASHBOARD_HTML)
         self.assertIn("Market target price:", DASHBOARD_HTML)
         self.assertIn("return'log-target'", DASHBOARD_HTML)
+
+    def test_dashboard_terminal_hides_scrollbars(self):
+        self.assertIn("scrollbar-width:none", DASHBOARD_HTML)
+        self.assertIn("-ms-overflow-style:none", DASHBOARD_HTML)
+        self.assertIn(".terminal::-webkit-scrollbar{display:none", DASHBOARD_HTML)
+        self.assertIn("overflow-wrap:anywhere", DASHBOARD_HTML)
+
+    def test_dashboard_run_tab_uses_available_viewport_space(self):
+        self.assertIn("width:calc(100% - 32px)", DASHBOARD_HTML)
+        self.assertIn("min-height:calc(100dvh - 116px)", DASHBOARD_HTML)
+        self.assertIn("#run:not(.hidden){display:flex;flex:1;min-height:0}", DASHBOARD_HTML)
+        self.assertIn(".run-grid{width:100%;min-height:0", DASHBOARD_HTML)
+        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto}", DASHBOARD_HTML)
+        self.assertIn("@media(min-width:1321px){body{height:100dvh;overflow:hidden}", DASHBOARD_HTML)
 
     def test_dashboard_html_includes_active_position_view(self):
         self.assertIn("activeOverview", DASHBOARD_HTML)

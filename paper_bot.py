@@ -39,11 +39,11 @@ DEFAULT_TAKE_PROFIT = 0.88
 DEFAULT_STOP_LOSS = 0.58
 DEFAULT_HARD_EXIT = 0.58
 DEFAULT_LATE_SECONDS = 30
-DEFAULT_MIN_DISTANCE_USD = 25.0
-DEFAULT_ENTRY_WINDOW_SECONDS = 0
+DEFAULT_MIN_DISTANCE_USD = 100.0
+DEFAULT_ENTRY_WINDOW_SECONDS = 120
 DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET = 1
 DEFAULT_MARKET_LOCK_AFTER_LOSS = True
-DEFAULT_NO_ENTRY_AFTER_SECONDS = 180
+DEFAULT_NO_ENTRY_AFTER_SECONDS = 0
 DEFAULT_MAX_SUM_ASKS = 1.03
 DEFAULT_PRESETS = [
     {
@@ -56,33 +56,33 @@ DEFAULT_PRESETS = [
         "stop_loss": 0.60,
         "hard_exit": 0.60,
         "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": DEFAULT_MIN_DISTANCE_USD,
+        "min_distance_usd": 100.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
     {
         "key": "balanced",
         "name": "Can bang",
         "enabled": True,
-        "entry_min": 0.63,
+        "entry_min": 0.65,
         "entry_max": 0.70,
         "take_profit": 0.86,
         "stop_loss": 0.58,
         "hard_exit": 0.58,
         "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": 20.0,
+        "min_distance_usd": 75.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
     {
         "key": "aggressive",
         "name": "Aggressive",
         "enabled": True,
-        "entry_min": 0.60,
+        "entry_min": 0.65,
         "entry_max": 0.72,
         "take_profit": 0.88,
         "stop_loss": 0.56,
         "hard_exit": 0.56,
         "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": 15.0,
+        "min_distance_usd": 75.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
 ]
@@ -2029,7 +2029,13 @@ def latest_run_db_path() -> Path | None:
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def run_sort_key(path: Path) -> tuple[str, float, str]:
+        match = re.match(r"^(\d{8}_\d{6}Z)", path.name)
+        timestamp = match.group(1) if match else ""
+        return timestamp, path.stat().st_mtime, path.name
+
+    return max(candidates, key=run_sort_key)
 
 
 def initial_dashboard_db_path(db_path: Path) -> Path:
@@ -2422,11 +2428,8 @@ DASHBOARD_HTML_OLD = r"""<!doctype html>
     .control-panel { height: auto; min-height: 0; overflow: visible; }
     .terminal-panel { height: min(760px, calc(100dvh - 165px)); min-height: 560px; }
     .terminal-panel { display: flex; flex-direction: column; min-height: 0; }
-    .terminal { flex: 1; background: var(--terminal); color: #c8d6d1; border: 1px solid #26322f; border-radius: var(--radius); padding: 12px; min-height: 0; max-height: none; overflow: auto; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; box-shadow: inset 0 0 0 1px rgba(255,255,255,.02); }
-    .terminal::-webkit-scrollbar { width: 10px; height: 10px; }
-    .terminal::-webkit-scrollbar-track { background: #0b1110; }
-    .terminal::-webkit-scrollbar-thumb { background: #42524d; border-radius: 999px; border: 2px solid #0b1110; }
-    .terminal::-webkit-scrollbar-thumb:hover { background: #5a6d66; }
+    .terminal { flex: 1; background: var(--terminal); color: #c8d6d1; border: 1px solid #26322f; border-radius: var(--radius); padding: 12px; min-height: 0; max-height: none; overflow: auto; overflow-wrap: anywhere; scrollbar-width: none; -ms-overflow-style: none; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; box-shadow: inset 0 0 0 1px rgba(255,255,255,.02); }
+    .terminal::-webkit-scrollbar { display: none; width: 0; height: 0; }
     .terminal .log-line { display: block; min-height: 18px; }
     .terminal .log-time { color: #708079; }
     .terminal .log-start { color: var(--accent); font-weight: 700; }
@@ -2524,10 +2527,10 @@ DASHBOARD_HTML_OLD = r"""<!doctype html>
                 <input id="late_seconds" name="late_seconds" type="number" min="0" max="300" step="1" value="30">
               </label>
               <label>Khoảng cách BTC tối thiểu
-                <input id="min_distance_usd" name="min_distance_usd" type="number" min="0" step="1" value="25">
+                <input id="min_distance_usd" name="min_distance_usd" type="number" min="0" step="1" value="100">
               </label>
               <label>Chỉ vào khi còn <= giây
-                <input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="0">
+                <input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="120">
               </label>
 
               <div class="section-title">Bộ lọc rủi ro</div>
@@ -2535,7 +2538,7 @@ DASHBOARD_HTML_OLD = r"""<!doctype html>
                 <input id="max_trades_per_label_per_market" name="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1">
               </label>
               <label>Không vào sau giây
-                <input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="180">
+                <input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="0">
               </label>
               <label>Tổng ask tối đa
                 <input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03">
@@ -2930,7 +2933,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     *{box-sizing:border-box} body{margin:0;min-height:100dvh;background:var(--bg);color:var(--ink)}
     header{position:sticky;top:0;z-index:5;background:rgba(11,15,14,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(14px)}
-    .wrap,main{width:min(100% - 40px,1840px);margin:0 auto}.wrap{padding:14px 0 12px}main{padding:16px 0 42px}
+    .wrap,main{width:calc(100% - 32px);margin:0 auto}.wrap{padding:14px 0 12px}main{display:flex;flex-direction:column;min-height:calc(100dvh - 116px);padding:12px 0 16px}main>section{min-height:0;width:100%}main>section:not(.hidden){flex:1}
     .topbar,.statusline,.row,.command-row,.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.topbar{justify-content:space-between}
     h1{margin:0;font-size:21px;line-height:1.15;letter-spacing:0}h2{margin:0 0 12px;font-size:14px;font-weight:760}h3{margin:0;font-size:13px}
     .subtle{color:var(--muted);font-size:12px}.dot{width:9px;height:9px;border-radius:50%;background:#65736e;display:inline-block}
@@ -2942,7 +2945,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .tab.active,.primary{background:var(--accent);border-color:var(--accent);color:#04110f}.danger{color:var(--bad);border-color:rgba(239,115,95,.55)}
     button:disabled,input:disabled,select:disabled{opacity:.48;cursor:not-allowed}input,select{width:100%;min-height:34px;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:#0e1413;color:var(--ink)}
     input:focus,select:focus,button:focus{outline:2px solid rgba(32,183,162,.35);outline-offset:2px}label{display:grid;gap:5px;color:var(--muted);font-size:12px;font-weight:650}
-    .grid{display:grid;gap:12px}.run-grid{grid-template-columns:minmax(740px,1.15fr) minmax(460px,.85fr);align-items:start}
+    .grid{display:grid;gap:12px}#run:not(.hidden){display:flex;flex:1;min-height:0}.run-grid{width:100%;min-height:0;grid-template-columns:minmax(0,1.35fr) minmax(460px,.65fr);align-items:stretch}#runForm{min-height:0;grid-template-rows:auto minmax(0,1fr)}#runForm>.panel:last-of-type{min-height:0}
     .two{grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr)}.metrics{grid-template-columns:repeat(6,minmax(0,1fr))}
     .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
     .metric .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.metric .value{margin-top:7px;font-size:22px;font-weight:780}
@@ -2950,31 +2953,33 @@ DASHBOARD_HTML = r"""<!doctype html>
     .risk-grid{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-top:12px}
     .checkline{display:flex;align-items:center;gap:8px;min-height:34px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#0e1413;color:var(--ink)}
     .checkline input{width:16px;min-height:16px;accent-color:var(--accent)}
-    .preset-board{display:grid;gap:10px;margin-top:12px}.preset-row{display:grid;grid-template-columns:118px repeat(8,minmax(76px,1fr)) 150px;gap:8px;align-items:end;border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0e1413}
+    .preset-board{display:grid;gap:10px;margin-top:12px}.preset-row{display:grid;grid-template-columns:96px repeat(8,minmax(62px,1fr)) minmax(100px,.9fr);gap:8px;align-items:end;border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0e1413}
     .preset-row[data-preset=safe]{border-left-color:var(--good)}.preset-row[data-preset=balanced]{border-left-color:var(--warn)}.preset-row[data-preset=aggressive]{border-left-color:var(--bad)}
     .preset-title{display:grid;gap:6px;align-self:center}.preset-title label{display:flex;align-items:center;gap:8px;color:var(--ink)}.preset-title input{width:16px;min-height:16px;accent-color:var(--accent)}
     .rr-box{display:grid;gap:3px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#101815}.rr-box strong{font-size:15px}.rr-box.good strong{color:var(--good)}.rr-box.thin strong{color:var(--warn)}.rr-box.bad strong{color:var(--bad)}
     .notice{margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:var(--radius);background:#101815;color:var(--ink);font-size:13px}
-    .terminal-panel{display:flex;flex-direction:column;min-height:640px;height:min(760px,calc(100dvh - 160px))}
-    .terminal{flex:1;min-height:260px;overflow:auto;margin:0;padding:12px;border:1px solid #26322f;border-radius:var(--radius);background:var(--terminal);color:#c8d6d1;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;white-space:pre-wrap}
+    .terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto}
+    .terminal{flex:1;min-height:0;overflow:auto;overflow-wrap:anywhere;scrollbar-width:none;-ms-overflow-style:none;margin:0;padding:12px;border:1px solid #26322f;border-radius:var(--radius);background:var(--terminal);color:#c8d6d1;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;white-space:pre-wrap}
+    .terminal::-webkit-scrollbar{display:none;width:0;height:0}
     .terminal.small{height:330px;flex:none}.terminal .log-line{display:block;min-height:18px}.terminal .log-time{color:#708079}.terminal .log-start{color:var(--accent);font-weight:700}.terminal .log-target{color:#ffd84d;font-weight:800}.terminal .log-watch{color:#aab7b2}.terminal .log-enter{color:var(--good);font-weight:700}.terminal .log-exit{color:var(--info);font-weight:700}.terminal .log-arb{color:var(--warn);font-weight:700}.terminal .log-hold{color:#8ec7ff}.terminal .log-end{color:#d8c27a}.terminal .log-error{color:var(--bad);font-weight:700}.terminal .log-muted{color:#73827d}
     .hidden{display:none}table{width:100%;border-collapse:collapse;font-size:12.5px}th,td{text-align:left;border-bottom:1px solid var(--border);padding:9px 8px;vertical-align:top}th{position:sticky;top:0;background:#101614;color:var(--muted);font-weight:720;z-index:1}
     .table-scroll{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius)}.chart{width:100%;height:280px;display:block;border:1px solid var(--border);border-radius:var(--radius);background:#0d1211}
     .stacked{display:grid;gap:3px;min-width:0}.stacked strong{font-weight:760;color:var(--ink)}.pos{color:var(--good)}.neg{color:var(--bad)}.empty{color:var(--muted);padding:24px;text-align:center}
     .preset-chip{border-color:currentColor;background:transparent}.preset-chip.safe{color:var(--good)}.preset-chip.balanced{color:var(--warn)}.preset-chip.aggressive{color:var(--bad)}
     .decision-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.decision-card{border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0f1514}.decision-card.safe{border-left-color:var(--good)}.decision-card.balanced{border-left-color:var(--warn)}.decision-card.aggressive{border-left-color:var(--bad)}
-    @media(max-width:1320px){.run-grid,.two{grid-template-columns:1fr}.setup-grid,.risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preset-row{grid-template-columns:repeat(4,minmax(0,1fr))}.preset-title,.rr-box{grid-column:1/-1}.metrics,.decision-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:760px){.wrap,main{width:min(100% - 24px,1840px)}.setup-grid,.risk-grid,.metrics,.decision-grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}.terminal-panel{min-height:520px}}
+    @media(min-width:1321px){body{height:100dvh;overflow:hidden}main{height:calc(100dvh - 116px);overflow:hidden}}
+    @media(max-width:1320px){main{min-height:auto}.run-grid,.two{grid-template-columns:1fr}.setup-grid,.risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preset-row{grid-template-columns:repeat(4,minmax(0,1fr))}.preset-title,.rr-box{grid-column:1/-1}.metrics,.decision-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.terminal-panel{min-height:620px}}
+    @media(max-width:760px){.wrap,main{width:calc(100% - 24px)}.setup-grid,.risk-grid,.metrics,.decision-grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}.terminal-panel{min-height:520px}}
   </style>
 </head>
 <body>
   <header><div class="wrap"><div class="topbar"><div><h1>Polymarket Paper Console</h1><div class="subtle" id="generated">Dang tai du lieu paper...</div></div><div class="statusline"><span class="dot" id="botDot"></span><span class="subtle" id="botStatus">Bot dang nghi</span><span class="pill data-pill" id="dataFile">Data: chua co run</span></div></div><nav class="tabs"><button class="tab active" data-tab="run">Chay bot</button><button class="tab" data-tab="overview">Tong quan</button><button class="tab" data-tab="trades">Lenh</button><button class="tab" data-tab="live">Theo doi</button></nav></div></header>
   <main>
-    <section id="run"><div class="grid run-grid"><form id="runForm" class="grid"><div class="panel"><h2>Run setup</h2><div class="setup-grid"><label>URL hoac slug Polymarket<input id="url" name="url" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required></label><label>So keo noi tiep<input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="6"></label><label>Giay moi lan quet<input id="poll" name="poll" type="number" min="1" max="60" step="1" value="2"></label><label>Size paper USD<input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1"></label><label>Giay chay override<input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Tu dong"></label></div><div class="risk-grid"><label>Khong vao sau giay<input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="180"></label><label>Tong ask toi da<input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03"></label><label>Chi vao khi con <= giay<input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="0"></label><label>Buffer arb<input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.01"></label><label>Fee du phong<input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07"></label><label>Giay giua cac keo<input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300"></label><label>Timeout tim keo<input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60"></label><label>Giay dem ket thuc<input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1"></label><input type="hidden" name="market_lock_after_loss" value="false"><label class="checkline"><input id="market_lock_after_loss" name="market_lock_after_loss" type="checkbox" value="true" checked><span>Khoa market sau lenh lo</span></label></div></div>
+    <section id="run"><div class="grid run-grid"><form id="runForm" class="grid"><div class="panel"><h2>Run setup</h2><div class="setup-grid"><label>URL hoac slug Polymarket<input id="url" name="url" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required></label><label>So keo noi tiep<input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="6"></label><label>Giay moi lan quet<input id="poll" name="poll" type="number" min="1" max="60" step="1" value="2"></label><label>Size paper USD<input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1"></label><label>Giay chay override<input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Tu dong"></label></div><div class="risk-grid"><label>Khong vao sau giay<input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="0"></label><label>Tong ask toi da<input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03"></label><label>Chi vao khi con <= giay<input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="120"></label><label>Buffer arb<input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.01"></label><label>Fee du phong<input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07"></label><label>Giay giua cac keo<input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300"></label><label>Timeout tim keo<input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60"></label><label>Giay dem ket thuc<input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1"></label><input type="hidden" name="market_lock_after_loss" value="false"><label class="checkline"><input id="market_lock_after_loss" name="market_lock_after_loss" type="checkbox" value="true" checked><span>Khoa market sau lenh lo</span></label></div></div>
     <div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Preset strategy matrix</h2><span class="subtle">R:R cap nhat realtime theo entry / TP / SL</span></div><div class="preset-board" id="presetBoard">
-      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>An toan</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.84"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="25"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Can bang</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.63"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="20"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="15"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>An toan</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.84"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="100"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Can bang</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
     </div><div class="command-row" style="margin-top:12px"><button class="primary" id="startBtn" type="submit">Chay bot</button><button id="stopBtn" type="button">Dung bot</button><button class="danger" id="resetBtn" type="button">Xoa du lieu</button><button id="closeAppBtn" type="button">Dong app</button></div><div class="notice" id="controlNotice">San sang.</div></div></form><div class="panel terminal-panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Nhat ky</h2><span class="pill" id="pidPill">Chua chay</span></div><pre class="terminal" id="terminal">Dang cho log bot...</pre></div></div></section>
     <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Suc khoe chien luoc</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Lenh dang mo</h2><span class="pill" id="activeOverviewCount">0 lenh</span></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Theo market</h2><div class="table-scroll"><table id="markets"></table></div></div><div class="panel"><h2>Theo outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div></div></section>
     <section id="trades" class="hidden"><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Trade journal</h2><div class="toolbar"><input id="filter" placeholder="Loc market, outcome, ly do"><select id="presetFilter"><option value="all">Tat ca preset</option></select><select id="resultFilter"><option value="all">Tat ca lenh</option><option value="wins">Lenh lai</option><option value="losses">Lenh lo</option></select></div></div><div class="table-scroll"><table id="tradesTable"></table></div></div></section>

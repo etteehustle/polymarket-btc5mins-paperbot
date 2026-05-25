@@ -48,13 +48,13 @@ If all sources are unavailable, the bot waits during lookup and then fails close
 The optimized default band is:
 
 ```powershell
---entry-min 0.65 --entry-max 0.68 --take-profit 0.88 --stop-loss 0.58 --hard-exit 0.58
+--entry-min 0.65 --entry-max 0.68 --take-profit 0.88 --stop-loss 0.58 --hard-exit 0.58 --min-distance-usd 100
 ```
 
 Risk guard defaults:
 
 ```powershell
---max-trades-per-label-per-market 1 --market-lock-after-loss --no-entry-after-seconds 180 --max-sum-asks 1.03
+--max-trades-per-label-per-market 1 --market-lock-after-loss --no-entry-after-seconds 0 --max-sum-asks 1.03 --entry-window-seconds 120
 ```
 
 Optionally limit entries to the final part of a market:
@@ -63,7 +63,7 @@ Optionally limit entries to the final part of a market:
 --entry-window-seconds 120
 ```
 
-Use `--entry-window-seconds 0` to disable the remaining-time gate. This is the default so it does not conflict with `--no-entry-after-seconds 180`.
+Use `--entry-window-seconds 0` to disable the remaining-time gate. The default is 120 seconds, and `--no-entry-after-seconds` defaults to 0 so the late-window filter can operate without an elapsed-time cutoff conflict.
 
 You can override the runtime if needed:
 
