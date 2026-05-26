@@ -58,7 +58,7 @@ DEFAULT_NO_ENTRY_AFTER_SECONDS = 0
 DEFAULT_MAX_SUM_ASKS = 1.03
 DEFAULT_TARGET_PRICE_START_DELAY_SECONDS = 5
 DEFAULT_TARGET_PRICE_RETRY_SECONDS = 3
-DEFAULT_TARGET_PRICE_MAX_RETRIES = 5
+DEFAULT_TARGET_PRICE_MAX_RETRIES = 10
 UPDOWN_5M_DURATION_SECONDS = 300
 POLYMARKET_RTDS_URL = "wss://ws-live-data.polymarket.com"
 POLYMARKET_CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -690,13 +690,10 @@ def fetch_market_info_with_retry(
     last_error: ValueError | None = None
     while True:
         try:
-            market = fetch_market_info(url_or_slug)
+            market = fetch_market_info(url_or_slug, allow_target_fallback=not require_target)
             if not require_target:
                 return market
-            missing_reason = target_unavailable_reason(market, previous_target_price)
-            if missing_reason is None:
-                return market
-            last_error = ValueError(f"market target price is {missing_reason}")
+            missing_reason = "waiting for target lookup window"
             break
         except ValueError as exc:
             last_error = exc

@@ -669,6 +669,11 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(paper_bot.target_retry_wait_seconds(start_ts=1_000, now_ts=999), 6)
         self.assertEqual(paper_bot.target_retry_wait_seconds(start_ts=1_000, now_ts=1_005), 0)
 
+    def test_default_target_retry_policy(self):
+        self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_START_DELAY_SECONDS, 5)
+        self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_RETRY_SECONDS, 3)
+        self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_MAX_RETRIES, 10)
+
     def test_fetch_market_info_with_retry_waits_then_retries_required_target(self):
         no_target = paper_bot.MarketInfo(
             slug="btc-updown-5m-1000",
@@ -702,6 +707,38 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(market.target_price, 77000.0)
         self.assertEqual(fetch_info.call_count, 3)
         self.assertEqual(sleep.call_args_list, [call(5), call(3)])
+
+    def test_fetch_market_info_with_retry_waits_until_start_delay_even_if_target_exists(self):
+        early_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=76000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        delayed_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=77000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        with patch("paper_bot.fetch_market_info", side_effect=[early_target, delayed_target]) as fetch_info:
+            with patch("paper_bot.target_retry_wait_seconds", return_value=5):
+                with patch("paper_bot.time.sleep") as sleep:
+                    market = paper_bot.fetch_market_info_with_retry(
+                        "btc-updown-5m-1000",
+                        timeout_seconds=60,
+                        require_target=True,
+                    )
+
+        self.assertEqual(market.target_price, 77000.0)
+        self.assertEqual(fetch_info.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(5)])
 
     def test_fetch_market_info_with_retry_rejects_previous_market_target(self):
         stale_target = paper_bot.MarketInfo(

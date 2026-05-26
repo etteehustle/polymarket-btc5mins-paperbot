@@ -148,7 +148,7 @@ Realtime safeguards:
 
 - the CLOB market WebSocket sends `PING` every 10 seconds and reconnects with backoff
 - RTDS sends `PING` every 5 seconds and rejects stale current prices
-- price-to-beat fallback data is not accepted until 5 seconds after the market start; if the target is still missing, the bot retries every 3 seconds up to 5 times and then stops
+- price-to-beat lookup starts 5 seconds after the market start; if the target is still missing, the bot retries every 3 seconds up to 10 times and then stops
 - when chaining markets, a target that exactly matches the previous market target is treated as stale and retried instead of being shown as the new price to beat
 - BTC up/down 5m markets use the timestamp in the slug as the trading window, so the old market watcher ends at `slug_ts + 300s` instead of waiting on stale metadata
 - if the CLOB book stream closes after the market end, the bot treats it as normal market completion and moves to the next chained market
