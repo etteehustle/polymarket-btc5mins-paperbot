@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -46,6 +51,9 @@ DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET = 1
 DEFAULT_MARKET_LOCK_AFTER_LOSS = True
 DEFAULT_NO_ENTRY_AFTER_SECONDS = 0
 DEFAULT_MAX_SUM_ASKS = 1.03
+CHAINLINK_DATASTREAMS_BASE_URL = "https://api.dataengine.chain.link"
+CHAINLINK_PRICE_SCALE = 10**18
+POLYMARKET_RTDS_URL = "wss://ws-live-data.polymarket.com"
 DEFAULT_PRESETS = [
     {
         "key": "safe",
@@ -124,6 +132,7 @@ class DirectionalConfig:
     min_distance_usd: float
     poll: int
     seconds: int
+    resolution_source: str | None = None
 
 
 @dataclass
@@ -149,6 +158,7 @@ class MarketInfo:
     end_ts: int | None
     start_ts: int | None
     target_price: float | None
+    resolution_source: str | None
     outcomes: list[Outcome]
 
 
@@ -256,6 +266,20 @@ def extract_target_price(event_data: dict[str, Any], market_data: dict[str, Any]
             target = parse_optional_float(container.get(key))
             if target is not None:
                 return target
+    return None
+
+
+def extract_resolution_source(event_data: dict[str, Any], market_data: dict[str, Any]) -> str | None:
+    containers = [
+        parse_json_object(event_data.get("eventMetadata")),
+        parse_json_object(market_data.get("eventMetadata")),
+        event_data,
+        market_data,
+    ]
+    for container in containers:
+        source = container.get("resolutionSource")
+        if isinstance(source, str) and source.strip():
+            return source.strip()
     return None
 
 
@@ -412,6 +436,7 @@ def fetch_market_info(url_or_slug: str) -> MarketInfo:
         end_ts=parse_ts(market.get("endDate")),
         start_ts=start_ts,
         target_price=target_price,
+        resolution_source=extract_resolution_source(event, market),
         outcomes=outcomes,
     )
 
@@ -454,9 +479,311 @@ def fetch_book(token_id: str) -> BookTop:
     )
 
 
-def fetch_btc_price() -> float:
-    data = http_json("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-    return float(data["price"])
+def env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def chainlink_stream_slug(resolution_source: str | None) -> str | None:
+    if not resolution_source:
+        return None
+    parsed = urllib.parse.urlparse(resolution_source)
+    host = parsed.netloc.lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host != "data.chain.link" or len(parts) < 2 or parts[0] != "streams":
+        return None
+    return parts[1].lower()
+
+
+def chainlink_auth_headers(method: str, path_with_params: str, api_key: str, user_secret: str, body: bytes = b"") -> dict[str, str]:
+    timestamp = str(int(time.time() * 1000))
+    body_hash = hashlib.sha256(body).hexdigest()
+    string_to_sign = f"{method.upper()} {path_with_params} {body_hash} {api_key} {timestamp}"
+    signature = hmac.new(user_secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "Authorization": api_key,
+        "X-Authorization-Timestamp": timestamp,
+        "X-Authorization-Signature-SHA256": signature,
+        "User-Agent": USER_AGENT,
+    }
+
+
+def fetch_chainlink_latest_report(feed_id: str, timeout: int = 20) -> dict[str, Any]:
+    base_url = env_first("CHAINLINK_DATASTREAMS_BASE_URL") or CHAINLINK_DATASTREAMS_BASE_URL
+    api_key = env_first("CHAINLINK_DATASTREAMS_API_KEY", "CHAINLINK_STREAMS_API_KEY", "API_KEY")
+    user_secret = env_first("CHAINLINK_DATASTREAMS_USER_SECRET", "CHAINLINK_STREAMS_API_SECRET", "USER_SECRET")
+    if not api_key or not user_secret:
+        raise ValueError(
+            "Chainlink Data Streams credentials are required for exact Polymarket reference price. "
+            "Set CHAINLINK_DATASTREAMS_API_KEY and CHAINLINK_DATASTREAMS_USER_SECRET."
+        )
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("CHAINLINK_DATASTREAMS_BASE_URL must be an http(s) URL")
+    path = "/api/v1/reports/latest"
+    query = urllib.parse.urlencode({"feedID": feed_id})
+    path_with_params = f"{path}?{query}"
+    url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
+    req = urllib.request.Request(url, headers=chainlink_auth_headers("GET", path_with_params, api_key, user_secret))
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _hex_bytes(value: str) -> bytes:
+    raw = value[2:] if value.startswith("0x") else value
+    if len(raw) % 2:
+        raise ValueError("hex value must have an even number of characters")
+    return bytes.fromhex(raw)
+
+
+def _abi_uint(word: bytes) -> int:
+    return int.from_bytes(word, "big", signed=False)
+
+
+def _abi_int(word: bytes) -> int:
+    return int.from_bytes(word, "big", signed=True)
+
+
+def _decode_abi_dynamic_bytes(data: bytes, offset: int) -> bytes:
+    if offset < 0 or offset + 32 > len(data):
+        raise ValueError("invalid Chainlink report blob offset")
+    length = _abi_uint(data[offset : offset + 32])
+    start = offset + 32
+    end = start + length
+    if end > len(data):
+        raise ValueError("invalid Chainlink report blob length")
+    return data[start:end]
+
+
+def decode_chainlink_v3_report_prices(full_report_hex: str, expected_feed_id: str | None = None) -> dict[str, Any]:
+    full_report = _hex_bytes(full_report_hex)
+    min_words = 7
+    if len(full_report) < min_words * 32:
+        raise ValueError("Chainlink fullReport is too short")
+    report_blob_offset = _abi_uint(full_report[3 * 32 : 4 * 32])
+    report_blob = _decode_abi_dynamic_bytes(full_report, report_blob_offset)
+    if len(report_blob) < 9 * 32:
+        raise ValueError("Chainlink v3 reportBlob is too short")
+    feed_id = "0x" + report_blob[0:32].hex()
+    if expected_feed_id and feed_id.lower() != expected_feed_id.lower():
+        raise ValueError(f"Chainlink report feedID mismatch: {feed_id} != {expected_feed_id}")
+    price = _abi_int(report_blob[6 * 32 : 7 * 32]) / CHAINLINK_PRICE_SCALE
+    bid = _abi_int(report_blob[7 * 32 : 8 * 32]) / CHAINLINK_PRICE_SCALE
+    ask = _abi_int(report_blob[8 * 32 : 9 * 32]) / CHAINLINK_PRICE_SCALE
+    return {
+        "feedID": feed_id,
+        "validFromTimestamp": _abi_uint(report_blob[1 * 32 : 2 * 32]),
+        "observationsTimestamp": _abi_uint(report_blob[2 * 32 : 3 * 32]),
+        "price": price,
+        "bid": bid,
+        "ask": ask,
+    }
+
+
+def chainlink_report_price(report_payload: dict[str, Any], expected_feed_id: str) -> float:
+    report = report_payload.get("report") if isinstance(report_payload.get("report"), dict) else report_payload
+    if not isinstance(report, dict) or not isinstance(report.get("fullReport"), str):
+        raise ValueError("Chainlink latest report response did not include fullReport")
+    decoded = decode_chainlink_v3_report_prices(report["fullReport"], expected_feed_id=expected_feed_id)
+    return float(decoded["price"])
+
+
+def websocket_connect(url: str, timeout: float = 10.0) -> socket.socket:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "wss" or not parsed.netloc:
+        raise ValueError("Polymarket RTDS URL must be a wss URL")
+    host = parsed.hostname or ""
+    port = parsed.port or 443
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    raw = socket.create_connection((host, port), timeout=timeout)
+    sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    sock.settimeout(timeout)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    headers = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {parsed.netloc}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        f"User-Agent: {USER_AGENT}\r\n"
+        "\r\n"
+    )
+    sock.sendall(headers.encode("ascii"))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ValueError("Polymarket RTDS websocket closed during handshake")
+        response += chunk
+        if len(response) > 16_384:
+            raise ValueError("Polymarket RTDS websocket handshake response is too large")
+    status = response.split(b"\r\n", 1)[0]
+    if b" 101 " not in status:
+        raise ValueError(f"Polymarket RTDS websocket handshake failed: {status.decode('ascii', errors='replace')}")
+    return sock
+
+
+def websocket_read_exact(sock: socket.socket, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ValueError("Polymarket RTDS websocket closed unexpectedly")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def websocket_send_frame(sock: socket.socket, opcode: int, payload: bytes = b"") -> None:
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.extend([0x80 | 126, (length >> 8) & 0xFF, length & 0xFF])
+    else:
+        header.extend([0x80 | 127])
+        header.extend(length.to_bytes(8, "big"))
+    mask = os.urandom(4)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    sock.sendall(bytes(header) + mask + masked)
+
+
+def websocket_send_text(sock: socket.socket, payload: dict[str, Any]) -> None:
+    websocket_send_frame(sock, 0x1, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+
+def websocket_recv_text(sock: socket.socket) -> str:
+    while True:
+        first, second = websocket_read_exact(sock, 2)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = int.from_bytes(websocket_read_exact(sock, 2), "big")
+        elif length == 127:
+            length = int.from_bytes(websocket_read_exact(sock, 8), "big")
+        mask = websocket_read_exact(sock, 4) if masked else b""
+        payload = websocket_read_exact(sock, length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        if opcode == 0x1:
+            return payload.decode("utf-8")
+        if opcode == 0x8:
+            raise ValueError("Polymarket RTDS websocket closed")
+        if opcode == 0x9:
+            websocket_send_frame(sock, 0xA, payload)
+
+
+class PolymarketRtdsPriceClient:
+    def __init__(self, symbol: str) -> None:
+        self.symbol = symbol.lower()
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.price: float | None = None
+        self.timestamp_ms: int | None = None
+        self.error: str | None = None
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._run, name=f"polymarket-rtds-{self.symbol}", daemon=True)
+            self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                self._stream_once()
+            except Exception as exc:
+                with self.lock:
+                    self.error = str(exc)
+                time.sleep(2)
+
+    def _stream_once(self) -> None:
+        sock = websocket_connect(POLYMARKET_RTDS_URL, timeout=10)
+        try:
+            websocket_send_text(
+                sock,
+                {
+                    "action": "subscribe",
+                    "subscriptions": [
+                        {
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": json.dumps({"symbol": self.symbol}, separators=(",", ":")),
+                        }
+                    ],
+                },
+            )
+            while True:
+                raw_message = websocket_recv_text(sock)
+                try:
+                    message = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    continue
+                payload = message.get("payload") if isinstance(message, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("symbol") or "").lower() != self.symbol:
+                    continue
+                value = parse_optional_float(payload.get("value"))
+                if value is None:
+                    continue
+                timestamp = payload.get("timestamp")
+                with self.lock:
+                    self.price = value
+                    self.timestamp_ms = int(timestamp) if isinstance(timestamp, (int, float, str)) and str(timestamp).isdigit() else None
+                    self.error = None
+                    self.ready.set()
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def get(self, timeout: float = 8.0) -> float:
+        self.start()
+        if not self.ready.wait(timeout):
+            with self.lock:
+                detail = f" Last error: {self.error}" if self.error else ""
+            raise ValueError(f"No Polymarket RTDS {self.symbol} price received within {timeout:.1f}s.{detail}")
+        with self.lock:
+            if self.price is None:
+                raise ValueError(f"No Polymarket RTDS {self.symbol} price is available")
+            return self.price
+
+
+POLYMARKET_RTDS_PRICE_CLIENTS: dict[str, PolymarketRtdsPriceClient] = {}
+POLYMARKET_RTDS_PRICE_CLIENTS_LOCK = threading.Lock()
+
+
+def fetch_polymarket_rtds_price(symbol: str = "btc/usd", timeout: float = 8.0) -> float:
+    normalized = symbol.lower()
+    with POLYMARKET_RTDS_PRICE_CLIENTS_LOCK:
+        client = POLYMARKET_RTDS_PRICE_CLIENTS.get(normalized)
+        if client is None:
+            client = PolymarketRtdsPriceClient(normalized)
+            POLYMARKET_RTDS_PRICE_CLIENTS[normalized] = client
+    return client.get(timeout=timeout)
+
+
+def fetch_reference_price(resolution_source: str | None, timeout: float = 8.0) -> float:
+    stream_slug = chainlink_stream_slug(resolution_source)
+    if stream_slug not in {"btc-usd", "btc-usd-cexprice-streams"}:
+        raise ValueError(
+            "Exact reference price requires Polymarket resolutionSource https://data.chain.link/streams/btc-usd. "
+            f"Got {resolution_source or 'none'}."
+        )
+    return fetch_polymarket_rtds_price("btc/usd", timeout=timeout)
 
 
 def fee_rate_from_base_fee(base_fee: Any) -> float:
@@ -908,13 +1235,16 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
     delete_active_position(con, cfg)
     position: PaperPosition | None = None
     end_ts = utc_now() + cfg.seconds
+    needs_reference = cfg.target_price is not None
+    if needs_reference:
+        fetch_reference_price(cfg.resolution_source)
     print(f"[{iso()}] paper watch started: {cfg.label}")
     print("No wallet. No private key. No real orders.")
     while utc_now() < end_ts:
         remaining = max(0, end_ts - utc_now())
         try:
             book = fetch_book(cfg.token_id)
-            btc = fetch_btc_price() if cfg.target_price is not None else None
+            btc = fetch_reference_price(cfg.resolution_source) if needs_reference else None
             save_snapshot(con, cfg.label, cfg.token_id, book, btc)
             if position is None:
                 enter, reason = should_enter(cfg, book, btc, remaining)
@@ -1080,10 +1410,26 @@ def watch_url(
             "Wait until eventMetadata.priceToBeat or /api/past-results is available, "
             "or set --min-distance-usd 0 to disable the distance filter."
         )
+    needs_reference = market.target_price is not None
+    if needs_reference:
+        fetch_reference_price(market.resolution_source)
     active_fee_rate = resolve_fee_rate([outcome.token_id for outcome in market.outcomes], fee_rate)
     end_ts = default_end_ts(market, seconds, end_buffer_seconds)
     run_seconds = max(0, end_ts - utc_now())
     con = init_db(db_path)
+    write_run_metadata(
+        db_path,
+        {
+            "market": {
+                "slug": market.slug,
+                "title": market.title,
+                "target_price": market.target_price,
+                "resolution_source": market.resolution_source,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+            }
+        },
+    )
     clear_active_positions(con, market.slug)
     positions: dict[str, PaperPosition | None] = {}
     trade_counts: dict[str, int] = {}
@@ -1118,6 +1464,7 @@ def watch_url(
                     min_distance_usd=float(preset["min_distance_usd"]),
                     poll=poll,
                     seconds=run_seconds,
+                    resolution_source=market.resolution_source,
                 )
             )
             positions[label] = None
@@ -1129,6 +1476,7 @@ def watch_url(
     if market.end_ts:
         print(f"Market end: {iso(market.end_ts)}")
     print(f"Market target price: {market.target_price if market.target_price is not None else 'n/a'}")
+    print(f"Market resolution source: {market.resolution_source if market.resolution_source else 'n/a'}")
     print(f"Watcher end: {iso(end_ts)}")
     print("Outcomes:")
     for outcome in market.outcomes:
@@ -1155,7 +1503,7 @@ def watch_url(
         remaining = max(0, end_ts - now_ts)
         try:
             books = {token_id: fetch_book(token_id) for token_id in {cfg.token_id for cfg in configs}}
-            btc = fetch_btc_price() if market.target_price is not None else None
+            btc = fetch_reference_price(market.resolution_source) if needs_reference else None
             for cfg in configs:
                 book = books[cfg.token_id]
                 save_snapshot(con, cfg.label, cfg.token_id, book, btc)
@@ -1518,6 +1866,49 @@ def read_run_metadata(con: sqlite3.Connection) -> dict[str, Any]:
     return metadata
 
 
+DASHBOARD_MARKET_CACHE: dict[str, tuple[int, dict[str, Any] | None]] = {}
+
+
+def ensure_dashboard_market_metadata(con: sqlite3.Connection, db_path: Path, run_metadata: dict[str, Any]) -> dict[str, Any]:
+    market_metadata = run_metadata.get("market") if isinstance(run_metadata.get("market"), dict) else {}
+    if market_metadata.get("target_price") is not None:
+        return market_metadata
+    config = run_metadata.get("config") if isinstance(run_metadata.get("config"), dict) else {}
+    source = str(run_metadata.get("source") or config.get("url") or "").strip()
+    if not source:
+        return market_metadata
+    cache_key = f"{db_path}:{source}"
+    cached = DASHBOARD_MARKET_CACHE.get(cache_key)
+    now = utc_now()
+    if cached and now - cached[0] < 60:
+        return cached[1] or market_metadata
+    try:
+        market = fetch_market_info(source)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError, TypeError):
+        DASHBOARD_MARKET_CACHE[cache_key] = (now, None)
+        return market_metadata
+    hydrated = {
+        "slug": market.slug,
+        "title": market.title,
+        "target_price": market.target_price,
+        "resolution_source": market.resolution_source,
+        "start_ts": market.start_ts,
+        "end_ts": market.end_ts,
+    }
+    DASHBOARD_MARKET_CACHE[cache_key] = (now, hydrated)
+    run_metadata["market"] = hydrated
+    con.execute(
+        """
+        INSERT INTO run_metadata (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        ("market", json.dumps(hydrated, ensure_ascii=False, separators=(",", ":"))),
+    )
+    con.commit()
+    return hydrated
+
+
 def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
     return {
         "generated_at": iso(),
@@ -1546,6 +1937,14 @@ def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
         "exits": [],
         "trades": [],
         "active_positions": [],
+        "market_reference": {
+            "target_price": None,
+            "current_price": None,
+            "distance": None,
+            "remaining_seconds": None,
+            "current_time": None,
+            "resolution_source": None,
+        },
         "snapshots": [],
         "arb": [],
         "arb_events": [],
@@ -1564,6 +1963,7 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     con = init_db(db_path)
     con.row_factory = sqlite3.Row
     run_metadata = read_run_metadata(con)
+    market_metadata = ensure_dashboard_market_metadata(con, db_path, run_metadata)
     preset_names = preset_name_map(run_metadata)
     total = con.execute(
         """
@@ -1739,6 +2139,24 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     for snap in latest_snapshots:
         snap["time"] = iso(int(snap["ts"])) if snap["ts"] else ""
     add_preset_names(latest_snapshots, preset_names)
+    latest_reference_snapshot = next((snap for snap in latest_snapshots if snap.get("btc_price") is not None), None)
+    target_price = market_metadata.get("target_price")
+    current_price = latest_reference_snapshot.get("btc_price") if latest_reference_snapshot else None
+    current_time = latest_reference_snapshot.get("time") if latest_reference_snapshot else None
+    if current_price is None and market_metadata.get("resolution_source"):
+        try:
+            current_price = fetch_reference_price(str(market_metadata.get("resolution_source")), timeout=3.0)
+            current_time = iso()
+        except (OSError, TimeoutError, ValueError):
+            current_price = None
+    market_reference = {
+        "target_price": target_price,
+        "current_price": current_price,
+        "distance": float(current_price) - float(target_price) if current_price is not None and target_price is not None else None,
+        "remaining_seconds": max(0, int(market_metadata["end_ts"]) - utc_now()) if market_metadata.get("end_ts") is not None else None,
+        "current_time": current_time,
+        "resolution_source": market_metadata.get("resolution_source"),
+    }
 
     arb = rows_to_dicts(
         con.execute(
@@ -1786,6 +2204,7 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
         "exits": exits,
         "trades": trades,
         "active_positions": active_positions,
+        "market_reference": market_reference,
         "snapshots": latest_snapshots,
         "arb": arb,
         "arb_events": arb_events,
@@ -3005,11 +3424,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     .hidden{display:none}table{width:100%;border-collapse:collapse;font-size:12.5px}th,td{text-align:left;border-bottom:1px solid var(--border);padding:9px 8px;vertical-align:top}th{position:sticky;top:0;background:#101614;color:var(--muted);font-weight:720;z-index:1}
     .table-scroll{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius)}.chart{width:100%;height:280px;display:block;border:1px solid var(--border);border-radius:var(--radius);background:#0d1211}
     .stacked{display:grid;gap:3px;min-width:0}.stacked strong{font-weight:760;color:var(--ink)}.pos{color:var(--good)}.neg{color:var(--bad)}.empty{color:var(--muted);padding:24px;text-align:center}
+    .market-reference{display:grid;grid-template-columns:minmax(120px,.8fr) minmax(170px,1fr) auto;gap:18px;align-items:end;margin:-2px 0 14px;padding:0 2px}.reference-stat{min-width:0}.reference-target{padding-right:18px;border-right:1px solid var(--line)}.reference-countdown{justify-self:end;text-align:right}.reference-label{display:block;color:#66727c;font-size:11px;font-weight:760;line-height:1.2}.reference-label-row{display:flex;align-items:center;gap:8px;min-width:0}.reference-current .reference-label{color:#f0a000}.reference-value{display:block;margin-top:5px;font-size:24px;line-height:1.05;font-weight:780;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reference-target .reference-value{color:#8c98a4}.reference-current .reference-value{color:#f7931a}.reference-distance-inline{font-size:11px;font-weight:780;white-space:nowrap}.reference-distance-inline.up{color:var(--good)}.reference-distance-inline.down{color:var(--bad)}.reference-time{display:block;margin-top:4px;color:#66756f;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.countdown-pair{display:flex;gap:12px;align-items:flex-end;justify-content:flex-end}.countdown-pair strong{display:block;color:#ff4f62;font-size:24px;line-height:1.05;font-weight:820}.countdown-pair small{display:block;margin-top:3px;color:#77828c;font-size:9px;font-weight:760;text-transform:uppercase}
     .preset-chip{border-color:currentColor;background:transparent}.preset-chip.safe{color:var(--good)}.preset-chip.balanced{color:var(--warn)}.preset-chip.aggressive{color:var(--bad)}
     .decision-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.decision-card{border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0f1514}.decision-card.safe{border-left-color:var(--good)}.decision-card.balanced{border-left-color:var(--warn)}.decision-card.aggressive{border-left-color:var(--bad)}
     @media(min-width:1321px){body{height:100dvh;overflow:hidden}main{height:calc(100dvh - 116px);overflow:hidden}}
     @media(max-width:1320px){main{min-height:auto}.run-grid,.two{grid-template-columns:1fr}.setup-grid,.risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preset-row{grid-template-columns:repeat(4,minmax(0,1fr))}.preset-title,.rr-box{grid-column:1/-1}.metrics,.decision-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.terminal-panel{min-height:620px}}
-    @media(max-width:760px){.wrap,main{width:calc(100% - 24px)}.setup-grid,.risk-grid,.metrics,.decision-grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}.terminal-panel{min-height:520px}}
+    @media(max-width:760px){.wrap,main{width:calc(100% - 24px)}.setup-grid,.risk-grid,.metrics,.decision-grid,.market-reference{grid-template-columns:1fr}.reference-target{padding-right:0;border-right:0}.reference-countdown{justify-self:start;text-align:left}.countdown-pair{justify-content:flex-start}.topbar{align-items:flex-start;flex-direction:column}.terminal-panel{min-height:520px}}
   </style>
 </head>
 <body>
@@ -3021,7 +3441,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Can bang</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
       <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.08"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.06"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
     </div><div class="command-row" style="margin-top:12px"><button class="primary" id="startBtn" type="submit">Chay bot</button><button id="stopBtn" type="button">Dung bot</button><button class="danger" id="resetBtn" type="button">Xoa du lieu</button><button id="closeAppBtn" type="button">Dong app</button></div><div class="notice" id="controlNotice">San sang.</div></div></form><div class="panel terminal-panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Nhat ky</h2><span class="pill" id="pidPill">Chua chay</span></div><pre class="terminal" id="terminal">Dang cho log bot...</pre></div></div></section>
-    <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Suc khoe chien luoc</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Lenh dang mo</h2><span class="pill" id="activeOverviewCount">0 lenh</span></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Theo market</h2><div class="table-scroll"><table id="markets"></table></div></div><div class="panel"><h2>Theo outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div></div></section>
+    <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Suc khoe chien luoc</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Lenh dang mo</h2><span class="pill" id="activeOverviewCount">0 lenh</span></div><div class="market-reference" id="activeMarketReference"></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Theo market</h2><div class="table-scroll"><table id="markets"></table></div></div><div class="panel"><h2>Theo outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div></div></section>
     <section id="trades" class="hidden"><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Trade journal</h2><div class="toolbar"><input id="filter" placeholder="Loc market, outcome, ly do"><select id="presetFilter"><option value="all">Tat ca preset</option></select><select id="resultFilter"><option value="all">Tat ca lenh</option><option value="wins">Lenh lai</option><option value="losses">Lenh lo</option></select></div></div><div class="table-scroll"><table id="tradesTable"></table></div></div></section>
     <section id="live" class="hidden"><div class="grid two"><div class="panel"><h2>Preset decision board</h2><div class="decision-grid" id="decisionBoard"></div></div><div class="panel"><h2>Orderbook moi nhat</h2><div class="table-scroll"><table id="snapshots"></table></div></div></div><div class="panel" style="margin-top:12px"><h2>Lenh dang mo</h2><div class="table-scroll"><table id="activePositions"></table></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Terminal log</h2><pre class="terminal small" id="terminalLive">Dang cho log bot...</pre></div><div class="panel"><h2>Arbitrage</h2><div id="arbSummary"></div><div class="table-scroll" style="margin-top:12px"><table id="arbEvents"></table></div></div></div></section>
   </main>
@@ -3039,6 +3459,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     function activePositionCell(r){return`<div class="stacked"><strong>${presetChip(r)} ${esc(r.market_slug||'n/a')} ${esc(r.outcome||'')}</strong><span class="subtle">Size ${valueMaybe(r.size_usd,2)} | Shares ${valueMaybe(r.shares,4)} | Entry ${valueMaybe(r.entry_price,2)}</span><span class="subtle">Giu ${Number(r.hold_seconds||0)}s</span></div>`}
     function activePriceCell(r){return`<div class="stacked"><strong>${valueMaybe(r.bid,2)}</strong><span class="subtle">Ask ${valueMaybe(r.ask,2)}</span></div>`}
     function activePnlCell(r){if(r.unrealized_pnl===null||r.unrealized_pnl===undefined)return'<span class="subtle">n/a</span>';const roi=r.unrealized_roi===null||r.unrealized_roi===undefined?'n/a':pct(r.unrealized_roi);return`<span class="${cls(r.unrealized_pnl)}"><strong>${Number(r.unrealized_pnl)>=0?'+':''}${fmt(r.unrealized_pnl)}</strong><br>${roi}</span>`}
+    function renderActiveMarketReference(data){const ref=data.market_reference||{},target=valueMaybe(ref.target_price,2),current=valueMaybe(ref.current_price,2),time=ref.current_time?esc(ref.current_time):'no snapshot',distance=ref.distance;let distClass='',distValue='<span class="subtle">n/a</span>';if(distance!==null&&distance!==undefined){const up=Number(distance)>=0;distClass=up?'up':'down';distValue=`${up?'&#9650;':'&#9660;'} ${up?'+':''}${fmt(distance,2)}`}const remaining=ref.remaining_seconds,mins=remaining===null||remaining===undefined?'--':String(Math.floor(Number(remaining)/60)).padStart(2,'0'),secs=remaining===null||remaining===undefined?'--':String(Number(remaining)%60).padStart(2,'0');document.getElementById('activeMarketReference').innerHTML=`<div class="reference-stat reference-target"><span class="reference-label">Price To Beat</span><span class="reference-value">${target}</span></div><div class="reference-stat reference-current"><div class="reference-label-row"><span class="reference-label">Current Price</span><span class="reference-distance-inline ${distClass}">${distValue}</span></div><span class="reference-value">${current}</span><span class="reference-time">${time}</span></div><div class="reference-stat reference-countdown"><span class="reference-value countdown-pair"><span><strong>${mins}</strong><small>mins</small></span><span><strong>${secs}</strong><small>secs</small></span></span></div>`}
     function setTab(name){document.querySelectorAll('main > section').forEach(el=>el.classList.toggle('hidden',el.id!==name));document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.dataset.tab===name))}
     document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>setTab(btn.dataset.tab)));
     function normalizeTrailingInput(event){const input=event.target;if(!input.matches('[data-preset-field="trail_start"],[data-preset-field="trail_distance"]'))return;const row=input.closest('.preset-row'),start=row.querySelector('[data-preset-field="trail_start"]'),distance=row.querySelector('[data-preset-field="trail_distance"]');if(Number(input.value)<=0){start.value='0';distance.value='0'}}
@@ -3059,8 +3480,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     function presetConfigByKey(){const config=state?.run?.config?.presets||collectPresets();return Object.fromEntries(config.map(p=>[p.key,p]))}
     function plannedRR(row){const p=presetConfigByKey()[row.preset_key];if(!p)return'<span class="subtle">n/a</span>';const rr=rrMetrics(p);return Number.isFinite(rr.avg)?`${rr.avg.toFixed(2)}R`:'<span class="neg">Invalid</span>'}
     function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">Tat ca preset</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all'}
-    function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">BTC ${valueMaybe(latest?.btc_price,2)} | ${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
-    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['BTC',r=>valueMaybe(r.btc_price,2)]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
+    function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
+    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;renderActiveMarketReference(data);table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
     function renderTrades(){if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,rows=state.trades.filter(r=>{const hay=`${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason} ${r.preset_name}`.toLowerCase();if(q&&!hay.includes(q))return false;if(presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true});table('tradesTable',[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Vao',r=>r.entry_time],['Thoat',r=>r.exit_time],['Giu',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],rows,'Khong co lenh phu hop')}
     document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
     async function refresh(){const res=await fetch('/api/dashboard',{cache:'no-store'});render(await res.json())}
@@ -3213,6 +3634,7 @@ def build_parser() -> argparse.ArgumentParser:
     directional.add_argument("--token-id", required=True)
     directional.add_argument("--label", required=True)
     directional.add_argument("--target-price", type=float)
+    directional.add_argument("--resolution-source", help="Polymarket resolutionSource URL, e.g. https://data.chain.link/streams/btc-usd")
     directional.add_argument("--direction", choices=["UP", "DOWN"], default="UP")
     directional.add_argument("--size-usd", type=float, default=1.0)
     directional.add_argument("--entry-min", type=float, default=0.65)
@@ -3280,6 +3702,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_distance_usd=args.min_distance_usd,
                 poll=args.poll,
                 seconds=args.seconds,
+                resolution_source=args.resolution_source,
             )
             watch_directional(cfg, args.db)
         elif args.cmd == "watch-arb":

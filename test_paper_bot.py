@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import paper_bot
 from paper_bot import (
@@ -11,9 +12,14 @@ from paper_bot import (
     DEFAULT_POLL_SECONDS,
     DirectionalConfig,
     auto_entry_precheck,
+    chainlink_auth_headers,
+    chainlink_stream_slug,
     dashboard_payload,
+    decode_chainlink_v3_report_prices,
     empty_dashboard_db_path,
+    extract_resolution_source,
     extract_target_price,
+    fetch_reference_price,
     initial_dashboard_db_path,
     init_db,
     latest_run_db_path,
@@ -36,6 +42,44 @@ from paper_bot import (
     upsert_active_position,
     url_or_slug_with_offset,
 )
+
+
+def abi_word(value, signed=False):
+    return int(value).to_bytes(32, "big", signed=signed)
+
+
+def padded_bytes(value):
+    padding = (32 - (len(value) % 32)) % 32
+    return value + (b"\x00" * padding)
+
+
+def sample_chainlink_full_report(feed_id, price, bid, ask):
+    feed = bytes.fromhex(feed_id.removeprefix("0x"))
+    scale = 10**18
+    report_blob = b"".join(
+        [
+            feed,
+            abi_word(100),
+            abi_word(101),
+            abi_word(0),
+            abi_word(0),
+            abi_word(200),
+            abi_word(int(price * scale), signed=True),
+            abi_word(int(bid * scale), signed=True),
+            abi_word(int(ask * scale), signed=True),
+        ]
+    )
+    head_words = [
+        b"\x00" * 32,
+        b"\x00" * 32,
+        b"\x00" * 32,
+        abi_word(7 * 32),
+        abi_word(0),
+        abi_word(0),
+        b"\x00" * 32,
+    ]
+    encoded_blob = abi_word(len(report_blob)) + padded_bytes(report_blob)
+    return "0x" + (b"".join(head_words) + encoded_blob).hex()
 
 
 def cfg(**overrides):
@@ -78,6 +122,39 @@ class StrategyTests(unittest.TestCase):
 
     def test_parse_json_list_from_gamma_string(self):
         self.assertEqual(parse_json_list('["Up", "Down"]'), ["Up", "Down"])
+
+    def test_extract_resolution_source_from_polymarket_metadata(self):
+        event = {"eventMetadata": '{"resolutionSource":"https://data.chain.link/streams/btc-usd"}'}
+        self.assertEqual(extract_resolution_source(event, {}), "https://data.chain.link/streams/btc-usd")
+
+    def test_chainlink_stream_slug_requires_data_chainlink_stream_url(self):
+        self.assertEqual(chainlink_stream_slug("https://data.chain.link/streams/btc-usd"), "btc-usd")
+        self.assertIsNone(chainlink_stream_slug("https://example.com/streams/btc-usd"))
+
+    def test_chainlink_auth_headers_match_documented_hmac_shape(self):
+        with patch("paper_bot.time.time", return_value=1716211845.123):
+            headers = chainlink_auth_headers("GET", "/api/v1/reports/latest?feedID=0xabc", "api-key", "secret")
+        self.assertEqual(headers["Authorization"], "api-key")
+        self.assertEqual(headers["X-Authorization-Timestamp"], "1716211845123")
+        self.assertIn("X-Authorization-Signature-SHA256", headers)
+
+    def test_decode_chainlink_v3_report_price(self):
+        feed_id = "0x" + "01" * 32
+        full_report = sample_chainlink_full_report(feed_id, price=77001.52, bid=77001.50, ask=77001.54)
+        decoded = decode_chainlink_v3_report_prices(full_report, expected_feed_id=feed_id)
+        self.assertAlmostEqual(decoded["price"], 77001.52)
+        self.assertAlmostEqual(decoded["bid"], 77001.50)
+        self.assertAlmostEqual(decoded["ask"], 77001.54)
+
+    def test_reference_price_uses_polymarket_rtds_chainlink_stream(self):
+        with patch("paper_bot.fetch_polymarket_rtds_price", return_value=77123.45) as fetch_price:
+            price = fetch_reference_price("https://data.chain.link/streams/btc-usd", timeout=3.0)
+        self.assertAlmostEqual(price, 77123.45)
+        fetch_price.assert_called_once_with("btc/usd", timeout=3.0)
+
+    def test_runtime_source_no_longer_uses_binance(self):
+        source = Path(paper_bot.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("api.binance.com", source)
 
     def test_slug_with_offset(self):
         self.assertEqual(slug_with_offset("btc-updown-5m-1779550500", 300, 2), "btc-updown-5m-1779551100")
@@ -481,6 +558,13 @@ class StrategyTests(unittest.TestCase):
     def test_dashboard_html_includes_active_position_view(self):
         self.assertIn("activeOverview", DASHBOARD_HTML)
         self.assertIn("activeOverviewCount", DASHBOARD_HTML)
+        self.assertIn("activeMarketReference", DASHBOARD_HTML)
+        self.assertIn("reference-current", DASHBOARD_HTML)
+        self.assertIn("reference-distance-inline", DASHBOARD_HTML)
+        self.assertIn("Price To Beat", DASHBOARD_HTML)
+        self.assertIn("Current Price", DASHBOARD_HTML)
+        self.assertIn("countdown-pair", DASHBOARD_HTML)
+        self.assertIn("#f7931a", DASHBOARD_HTML)
         self.assertIn("activePositions", DASHBOARD_HTML)
         self.assertIn("activePositionCell", DASHBOARD_HTML)
         self.assertIn("activePnlCell", DASHBOARD_HTML)
@@ -495,6 +579,10 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("data-preset-field=\"trail_start\"", DASHBOARD_HTML)
         self.assertIn("data-preset-field=\"trail_distance\"", DASHBOARD_HTML)
         self.assertIn("rrMetrics", DASHBOARD_HTML)
+
+    def test_dashboard_html_hides_binance_btc_reference_price(self):
+        self.assertNotIn("BTC ${valueMaybe(latest?.btc_price", DASHBOARD_HTML)
+        self.assertNotIn("['BTC',r=>valueMaybe(r.btc_price,2)]", DASHBOARD_HTML)
 
     def test_dashboard_equity_chart_marks_each_trade(self):
         self.assertIn("markers=rows.map", DASHBOARD_HTML)
@@ -516,6 +604,51 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(payload["overall"]["total_with_active_pnl"], 0.2)
         self.assertEqual(payload["active_positions"][0]["market_slug"], "test-market")
         self.assertAlmostEqual(payload["active_positions"][0]["unrealized_roi"], 20.0)
+
+    def test_dashboard_payload_includes_market_reference_prices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                paper_bot.write_run_metadata(
+                    db_path,
+                    {
+                        "market": {
+                            "target_price": 77000.0,
+                            "resolution_source": "https://data.chain.link/streams/btc-usd",
+                            "end_ts": paper_bot.utc_now() + 120,
+                        }
+                    },
+                )
+                paper_bot.save_snapshot(con, "test-market Up preset:safe", "token", book(bid=0.60, ask=0.62), btc_price=77123.45)
+            finally:
+                con.close()
+            payload = dashboard_payload(db_path)
+        self.assertAlmostEqual(payload["market_reference"]["target_price"], 77000.0)
+        self.assertAlmostEqual(payload["market_reference"]["current_price"], 77123.45)
+        self.assertAlmostEqual(payload["market_reference"]["distance"], 123.45)
+        self.assertGreaterEqual(payload["market_reference"]["remaining_seconds"], 0)
+        self.assertLessEqual(payload["market_reference"]["remaining_seconds"], 120)
+        self.assertEqual(payload["market_reference"]["resolution_source"], "https://data.chain.link/streams/btc-usd")
+
+    def test_dashboard_payload_falls_back_to_polymarket_rtds_current_price(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            paper_bot.write_run_metadata(
+                db_path,
+                {
+                    "market": {
+                        "target_price": 77000.0,
+                        "resolution_source": "https://data.chain.link/streams/btc-usd",
+                        "end_ts": paper_bot.utc_now() + 120,
+                    }
+                },
+            )
+            with patch("paper_bot.fetch_reference_price", return_value=77111.0) as fetch_price:
+                payload = dashboard_payload(db_path)
+        fetch_price.assert_called_once_with("https://data.chain.link/streams/btc-usd", timeout=3.0)
+        self.assertAlmostEqual(payload["market_reference"]["current_price"], 77111.0)
+        self.assertAlmostEqual(payload["market_reference"]["distance"], 111.0)
 
     def test_dashboard_payload_groups_trades_by_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
