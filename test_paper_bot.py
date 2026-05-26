@@ -59,7 +59,7 @@ def cfg(**overrides):
         token_id="token",
         label="test",
         preset_key="safe",
-        preset_name="An toan",
+        preset_name="Safe",
         market_slug="test-market",
         outcome="Up",
         target_price=100.0,
@@ -434,8 +434,41 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(books["down"].bid, 0.32)
         self.assertEqual(books["down"].ask, 0.35)
 
-    def test_market_ws_client_fails_closed_on_stale_books(self):
-        client = PolymarketMarketWsClient(["up"], stale_after_ms=100)
+    def test_market_ws_client_refreshes_stale_books_from_rest(self):
+        client = PolymarketMarketWsClient(["up"], stale_after_ms=100, rest_refresh_interval_ms=0)
+        client.start = lambda: None
+        client.apply_message(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "up",
+                "best_bid": "0.60",
+                "best_ask": "0.63",
+                "timestamp": "1",
+            },
+            received_ms=1,
+        )
+
+        rest_book = BookTop(
+            bid=0.61,
+            bid_size=20,
+            ask=0.64,
+            ask_size=30,
+            last=None,
+            raw={"hash": "rest"},
+            updated_ms=500,
+            source="rest",
+        )
+        with patch("paper_bot.fetch_book_rest", return_value=rest_book) as fetch_rest:
+            with patch("paper_bot.now_ms", return_value=500):
+                books = client.get_books(["up"], timeout=0)
+
+        fetch_rest.assert_called_once_with("up")
+        self.assertEqual(books["up"].bid, 0.61)
+        self.assertEqual(books["up"].ask, 0.64)
+        self.assertEqual(books["up"].source, "rest_refresh")
+
+    def test_market_ws_client_fails_closed_when_stale_rest_refresh_fails(self):
+        client = PolymarketMarketWsClient(["up"], stale_after_ms=100, rest_refresh_interval_ms=0)
         client.start = lambda: None
         client.apply_message(
             {
@@ -449,8 +482,33 @@ class StrategyTests(unittest.TestCase):
         )
 
         with patch("paper_bot.now_ms", return_value=500):
-            with self.assertRaises(ValueError):
-                client.get_books(["up"], timeout=0)
+            with patch("paper_bot.fetch_book_rest", side_effect=TimeoutError("rest timeout")):
+                with self.assertRaisesRegex(ValueError, "stale=up"):
+                    client.get_books(["up"], timeout=0)
+
+    def test_market_ws_client_throttles_repeated_rest_refreshes(self):
+        client = PolymarketMarketWsClient(["up"], stale_after_ms=100, rest_refresh_interval_ms=1000)
+        client.start = lambda: None
+        client.apply_message(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "up",
+                "best_bid": "0.60",
+                "best_ask": "0.63",
+                "timestamp": "1",
+            },
+            received_ms=1,
+        )
+
+        with patch("paper_bot.fetch_book_rest", side_effect=TimeoutError("rest timeout")) as fetch_rest:
+            with patch("paper_bot.now_ms", return_value=500):
+                with self.assertRaises(ValueError):
+                    client.get_books(["up"], timeout=0)
+            with patch("paper_bot.now_ms", return_value=600):
+                with self.assertRaises(ValueError):
+                    client.get_books(["up"], timeout=0)
+
+        fetch_rest.assert_called_once_with("up")
 
     def test_interval_gate_throttles_repeated_keys(self):
         gate = IntervalGate(interval_seconds=10)
@@ -672,7 +730,7 @@ class StrategyTests(unittest.TestCase):
     def test_default_target_retry_policy(self):
         self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_START_DELAY_SECONDS, 5)
         self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_RETRY_SECONDS, 3)
-        self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_MAX_RETRIES, 10)
+        self.assertEqual(paper_bot.DEFAULT_TARGET_PRICE_MAX_RETRIES, 20)
 
     def test_fetch_market_info_with_retry_waits_then_retries_required_target(self):
         no_target = paper_bot.MarketInfo(
@@ -1041,14 +1099,17 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("-ms-overflow-style:none", DASHBOARD_HTML)
         self.assertIn(".terminal::-webkit-scrollbar{display:none", DASHBOARD_HTML)
         self.assertIn("overflow-wrap:anywhere", DASHBOARD_HTML)
+        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto;max-height:100vh;overflow:hidden}", DASHBOARD_HTML)
 
     def test_dashboard_run_tab_uses_available_viewport_space(self):
         self.assertIn("width:calc(100% - 32px)", DASHBOARD_HTML)
+        self.assertIn("overflow-y:auto", DASHBOARD_HTML)
         self.assertIn("min-height:calc(100dvh - 116px)", DASHBOARD_HTML)
         self.assertIn("#run:not(.hidden){display:flex;flex:1;min-height:0}", DASHBOARD_HTML)
         self.assertIn(".run-grid{width:100%;min-height:0", DASHBOARD_HTML)
-        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto}", DASHBOARD_HTML)
-        self.assertIn("@media(min-width:1321px){body{height:100dvh;overflow:hidden}", DASHBOARD_HTML)
+        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto;max-height:100vh;overflow:hidden}", DASHBOARD_HTML)
+        self.assertNotIn("body{height:100dvh;overflow:hidden}", DASHBOARD_HTML)
+        self.assertNotIn("main{height:calc(100dvh - 116px);overflow:hidden}", DASHBOARD_HTML)
 
     def test_dashboard_html_includes_active_position_view(self):
         self.assertIn("activeOverview", DASHBOARD_HTML)
@@ -1091,6 +1152,59 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("<circle cx=", DASHBOARD_HTML)
         self.assertIn("PnL ${Number(r.pnl)", DASHBOARD_HTML)
 
+    def test_dashboard_html_includes_manual_trade_ticket(self):
+        self.assertIn("manualTicket", DASHBOARD_HTML)
+        self.assertIn("manualMarketTime", DASHBOARD_HTML)
+        self.assertIn("manualMarketTimeLabel", DASHBOARD_HTML)
+        self.assertIn("America/New_York", DASHBOARD_HTML)
+        self.assertIn("manualBudgetInput", DASHBOARD_HTML)
+        self.assertIn("manualResetPnl", DASHBOARD_HTML)
+        self.assertIn("data-manual-outcome=\"Up\"", DASHBOARD_HTML)
+        self.assertIn("data-manual-side=\"buy\"", DASHBOARD_HTML)
+        self.assertIn("/api/manual-trade", DASHBOARD_HTML)
+        self.assertIn("/api/manual-budget", DASHBOARD_HTML)
+        self.assertIn("/api/manual-reset-pnl", DASHBOARD_HTML)
+        self.assertIn("submitManualTrade", DASHBOARD_HTML)
+        self.assertIn("priceAtCeiling", DASHBOARD_HTML)
+        self.assertIn("is already 100c", DASHBOARD_HTML)
+
+    def test_dashboard_html_uses_english_ui_copy(self):
+        self.assertIn("Run bot", DASHBOARD_HTML)
+        self.assertIn("Overview", DASHBOARD_HTML)
+        self.assertIn("Open Positions", DASHBOARD_HTML)
+        self.assertIn("Waiting for bot logs...", DASHBOARD_HTML)
+        self.assertIn("All presets", DASHBOARD_HTML)
+        vietnamese_phrases = [
+            "Chay bot",
+            "Tong quan",
+            "Theo doi",
+            "Lenh dang mo",
+            "Dang cho log bot",
+            "Chua co",
+            "Khong co",
+            "Mua Up",
+            ">Mua<",
+            ">Ban<",
+            "Giu ",
+            ">Luu<",
+            "Tat ca",
+            "du lieu",
+            " lenh",
+        ]
+        for phrase in vietnamese_phrases:
+            self.assertNotIn(phrase, DASHBOARD_HTML)
+
+    def test_dashboard_overview_layout_reorders_panels(self):
+        self.assertIn(".overview-market-row{grid-template-columns:minmax(300px,1fr) minmax(0,2fr)}", DASHBOARD_HTML)
+        self.assertIn(".overview-performance-row{grid-template-columns:minmax(0,2fr) minmax(300px,1fr)}", DASHBOARD_HTML)
+        self.assertIn(".overview-manual-row{grid-template-columns:minmax(300px,1fr) minmax(0,2fr)}", DASHBOARD_HTML)
+        self.assertIn("function organizeDashboardLayout()", DASHBOARD_HTML)
+        self.assertIn("marketRow.append(activePanel,equityPanel)", DASHBOARD_HTML)
+        self.assertIn("performanceRow.append(presetPanel,healthPanel)", DASHBOARD_HTML)
+        self.assertIn("manualRow.append(manualTicketEl,journalPanel)", DASHBOARD_HTML)
+        self.assertIn("tradesRow.append(marketPanel,outcomePanel)", DASHBOARD_HTML)
+        self.assertIn("organizeDashboardLayout();updatePresetRisk();refresh()", DASHBOARD_HTML)
+
     def test_dashboard_payload_includes_active_position_unrealized_pnl(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "paper.sqlite"
@@ -1106,6 +1220,306 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(payload["overall"]["total_with_active_pnl"], 0.2)
         self.assertEqual(payload["active_positions"][0]["market_slug"], "test-market")
         self.assertAlmostEqual(payload["active_positions"][0]["unrealized_roi"], 20.0)
+
+    def test_manual_trade_buys_and_partially_sells_current_market(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            end_ts = paper_bot.utc_now() + 120
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-new",
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": end_ts,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                latest_book = BookTop(
+                    bid=0.50,
+                    bid_size=90,
+                    ask=0.56,
+                    ask_size=80,
+                    last=0.53,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="test",
+                )
+                price = paper_bot.PriceSnapshot(77123.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, "btc-updown-5m-new", "Up", "up-token", latest_book, price, clock, 42)
+            finally:
+                con.close()
+
+            buy = paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 2})
+            self.assertTrue(buy["ok"])
+            self.assertAlmostEqual(buy["price"], 0.56)
+            self.assertAlmostEqual(buy["shares"], 2 / 0.56)
+
+            payload = dashboard_payload(db_path)
+            self.assertEqual(payload["manual_trade"]["start_ts"], 1_000)
+            self.assertEqual(payload["manual_trade"]["end_ts"], end_ts)
+            manual_up = next(row for row in payload["manual_trade"]["outcomes"] if row["outcome"] == "Up")
+            self.assertAlmostEqual(manual_up["position_shares"], 2 / 0.56)
+            self.assertEqual(payload["active_positions"], [])
+            self.assertEqual(payload["overall"]["active_positions"], 0)
+            self.assertEqual(payload["overall"]["active_unrealized_pnl"], 0.0)
+
+            sell = paper_bot.manual_trade(db_path, {"side": "sell", "outcome": "Up", "percent": 50})
+            self.assertTrue(sell["ok"])
+            self.assertAlmostEqual(sell["price"], 0.50)
+            self.assertAlmostEqual(sell["remaining_shares"], (2 / 0.56) / 2)
+
+            payload = dashboard_payload(db_path)
+            manual_up = next(row for row in payload["manual_trade"]["outcomes"] if row["outcome"] == "Up")
+            self.assertAlmostEqual(manual_up["position_shares"], (2 / 0.56) / 2)
+            self.assertEqual(payload["trades"], [])
+            self.assertEqual(payload["overall"]["trades"], 0)
+            self.assertEqual(payload["overall"]["pnl"], 0.0)
+            con = init_db(db_path)
+            try:
+                manual_rows = con.execute("SELECT strategy, pnl FROM manual_trades").fetchall()
+                bot_rows = con.execute("SELECT strategy, pnl FROM paper_trades").fetchall()
+                manual_positions = con.execute("SELECT label, shares FROM manual_active_positions").fetchall()
+                bot_positions = con.execute("SELECT label, shares FROM active_positions").fetchall()
+            finally:
+                con.close()
+            self.assertEqual(len(manual_rows), 1)
+            self.assertEqual(bot_rows, [])
+            self.assertEqual(len(manual_positions), 1)
+            self.assertEqual(bot_positions, [])
+
+    def test_manual_trade_rejects_buy_when_selected_side_is_100_cents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-ceiling",
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                latest_book = BookTop(
+                    bid=0.99,
+                    bid_size=90,
+                    ask=1.0,
+                    ask_size=80,
+                    last=1.0,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="test",
+                )
+                price = paper_bot.PriceSnapshot(77123.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, "btc-updown-5m-ceiling", "Up", "up-token", latest_book, price, clock, 42)
+            finally:
+                con.close()
+
+            with self.assertRaisesRegex(ValueError, "100c"):
+                paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 1})
+
+    def test_manual_trade_settles_open_position_after_market_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            market_slug = "btc-updown-5m-settle"
+            write_market_context(
+                db_path,
+                {
+                    "slug": market_slug,
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                entry_book = BookTop(
+                    bid=0.50,
+                    bid_size=90,
+                    ask=0.56,
+                    ask_size=80,
+                    last=0.53,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="test",
+                )
+                entry_price = paper_bot.PriceSnapshot(76950.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="test")
+                entry_clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, market_slug, "Up", "up-token", entry_book, entry_price, entry_clock, 42)
+            finally:
+                con.close()
+
+            buy = paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 2})
+            bought_shares = buy["shares"]
+            self.assertGreater(bought_shares, 0)
+
+            write_market_context(
+                db_path,
+                {
+                    "slug": market_slug,
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() - 1,
+                    "status": "closed",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                final_price = paper_bot.PriceSnapshot(77123.0, timestamp_ms=2, received_ms=paper_bot.now_ms(), source="test")
+                final_clock = ClockSnapshot(unix_ts=paper_bot.utc_now(), source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Up",
+                    "up-token",
+                    BookTop(bid=1.0, bid_size=10, ask=1.0, ask_size=0, last=1.0, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    final_price,
+                    final_clock,
+                    0,
+                )
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Down",
+                    "down-token",
+                    BookTop(bid=0.0, bid_size=0, ask=0.0, ask_size=0, last=0.0, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    final_price,
+                    final_clock,
+                    0,
+                )
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+            manual_state = payload["manual_trade"]
+            self.assertEqual(manual_state["open_positions"], 0)
+            self.assertEqual(manual_state["trades"], 1)
+            self.assertAlmostEqual(manual_state["closed_pnl"], bought_shares - 2)
+            self.assertAlmostEqual(manual_state["available_budget_usd"], manual_state["budget_usd"])
+
+            con = init_db(db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                manual_rows = con.execute("SELECT outcome, exit_price, pnl, exit_reason FROM manual_trades").fetchall()
+                manual_position_count = con.execute("SELECT COUNT(*) AS count FROM manual_active_positions").fetchone()["count"]
+                bot_trade_count = con.execute("SELECT COUNT(*) AS count FROM paper_trades").fetchone()["count"]
+                bot_position_count = con.execute("SELECT COUNT(*) AS count FROM active_positions").fetchone()["count"]
+            finally:
+                con.close()
+            self.assertEqual(len(manual_rows), 1)
+            self.assertEqual(manual_rows[0]["outcome"], "Up")
+            self.assertAlmostEqual(manual_rows[0]["exit_price"], 1.0)
+            self.assertAlmostEqual(manual_rows[0]["pnl"], bought_shares - 2)
+            self.assertEqual(manual_rows[0]["exit_reason"], "manual_settle:up")
+            self.assertEqual(manual_position_count, 0)
+            self.assertEqual(bot_trade_count, 0)
+            self.assertEqual(bot_position_count, 0)
+
+    def test_init_db_migrates_legacy_manual_rows_out_of_bot_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                cfg_manual = paper_bot.manual_trade_config("up-token", "btc-updown-5m-old", "Up")
+                manual_position = PaperPosition(entry_ts=1_000, entry_price=0.56, shares=2.0, size_usd=1.12, reason="manual_buy")
+                upsert_active_position(con, cfg_manual, manual_position, book(bid=0.50, ask=0.56), btc_price=77123.0)
+                paper_bot.record_trade(
+                    con,
+                    cfg_manual,
+                    manual_position,
+                    0.50,
+                    "manual_sell:100%",
+                    strategy=paper_bot.MANUAL_STRATEGY,
+                )
+            finally:
+                con.close()
+
+            con = init_db(db_path)
+            try:
+                bot_trade_count = con.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
+                bot_position_count = con.execute("SELECT COUNT(*) FROM active_positions").fetchone()[0]
+                manual_trade_count = con.execute("SELECT COUNT(*) FROM manual_trades").fetchone()[0]
+                manual_position_count = con.execute("SELECT COUNT(*) FROM manual_active_positions").fetchone()[0]
+            finally:
+                con.close()
+
+            self.assertEqual(bot_trade_count, 0)
+            self.assertEqual(bot_position_count, 0)
+            self.assertEqual(manual_trade_count, 1)
+            self.assertEqual(manual_position_count, 1)
+
+    def test_manual_trade_has_budget_and_resettable_pnl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-budget",
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                latest_book = BookTop(
+                    bid=0.50,
+                    bid_size=90,
+                    ask=0.56,
+                    ask_size=80,
+                    last=0.53,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="test",
+                )
+                price = paper_bot.PriceSnapshot(77123.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, "btc-updown-5m-budget", "Up", "up-token", latest_book, price, clock, 42)
+            finally:
+                con.close()
+
+            budget_payload = paper_bot.manual_budget_update(db_path, {"budget_usd": 3})
+            self.assertEqual(budget_payload["manual_trade"]["budget_usd"], 3.0)
+
+            buy = paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 2})
+            self.assertTrue(buy["ok"])
+            with self.assertRaisesRegex(ValueError, "Manual budget"):
+                paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 2})
+
+            sell = paper_bot.manual_trade(db_path, {"side": "sell", "outcome": "Up", "percent": 50})
+            self.assertTrue(sell["ok"])
+
+            payload = dashboard_payload(db_path)
+            manual_state = payload["manual_trade"]
+            self.assertEqual(manual_state["budget_usd"], 3.0)
+            self.assertAlmostEqual(manual_state["open_size_usd"], 1.0)
+            self.assertAlmostEqual(manual_state["available_budget_usd"], 2.0)
+            self.assertLess(manual_state["total_pnl"], 0)
+            self.assertEqual(payload["overall"]["pnl"], 0.0)
+            self.assertEqual(payload["overall"]["active_unrealized_pnl"], 0.0)
+
+            reset_payload = paper_bot.manual_pnl_reset(db_path)
+            self.assertAlmostEqual(reset_payload["manual_trade"]["total_pnl"], 0.0)
+            self.assertAlmostEqual(reset_payload["manual_trade"]["budget_usd"], 3.0)
 
     def test_dashboard_payload_includes_market_reference_prices(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1383,7 +1797,7 @@ class StrategyTests(unittest.TestCase):
             db_path = Path(tmp) / "paper.sqlite"
             con = init_db(db_path)
             try:
-                safe_cfg = cfg(label="test-market Up preset:safe", preset_key="safe", preset_name="An toan")
+                safe_cfg = cfg(label="test-market Up preset:safe", preset_key="safe", preset_name="Safe")
                 aggressive_cfg = cfg(label="test-market Up preset:aggressive", preset_key="aggressive", preset_name="Aggressive")
                 paper_bot.record_trade(
                     con,
