@@ -10,7 +10,7 @@ This tool does not use a wallet, private key, API key, or real orders. It polls 
   - enter when the ask is around `0.65-0.68` by default
   - for BTC 5-minute `watch-url`, auto-read the market target from Polymarket `eventMetadata.priceToBeat`
   - risk guards default to one trade per label, market lock after a loss, no entries after 180 seconds, and `ask + opposite ask <= 1.03`
-  - exit on take profit, stop loss, hard stop, or late ambiguous BTC/target state
+  - exit on take profit, trailing stop, stop loss, or late ambiguous BTC/target state
 - Complete-set arbitrage scanner:
   - logs when `YES ask + NO ask + taker fees + buffer < 1`
   - logs when `YES bid + NO bid - taker fees - buffer > 1`
@@ -45,11 +45,16 @@ For BTC 5-minute `watch-url`, the bot reads the target price automatically, so y
 The first source is Gamma `eventMetadata.priceToBeat`. If that field is missing while the Polymarket page already shows the value, the bot falls back to Polymarket `/api/past-results` and then the event page's hydrated price data.
 If all sources are unavailable, the bot waits during lookup and then fails closed instead of silently trading without the distance filter. Use `--min-distance-usd 0` only if you intentionally want to disable the BTC-distance filter.
 
-The optimized default band is:
+The optimized dashboard presets are:
 
 ```powershell
---entry-min 0.65 --entry-max 0.68 --take-profit 0.88 --stop-loss 0.58 --hard-exit 0.58 --min-distance-usd 100
+Safe:       entry 0.65-0.68, TP 0.84, SL 0.60, trail 0.05/0.04, BTC dist 100
+Balanced:   entry 0.65-0.70, TP 0.86, SL 0.58, trail 0.05/0.05, BTC dist 75
+Aggressive: entry 0.65-0.72, TP 0.88, SL 0.56, trail 0.08/0.06, BTC dist 75
 ```
+
+Set `trail_start` and `trail_distance` to `0` to disable trailing. If either value is `0`, the bot normalizes both to `0` because a one-sided trailing config cannot arm a valid trailing stop.
+Set `take_profit` to `0` to disable the fixed TP exit and let trailing, stop loss, and late exit manage the position.
 
 Risk guard defaults:
 

@@ -22,6 +22,7 @@ from paper_bot import (
     past_results_target_url,
     fee_rate_from_base_fee,
     normalize_bot_config,
+    normalize_presets,
     parse_json_list,
     parse_slug,
     should_enter,
@@ -52,7 +53,8 @@ def cfg(**overrides):
         entry_max=0.72,
         take_profit=0.85,
         stop_loss=0.55,
-        hard_exit=0.50,
+        trail_start=0.0,
+        trail_distance=0.0,
         late_seconds=30,
         entry_window_seconds=None,
         min_distance_usd=10.0,
@@ -187,6 +189,39 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, "take_profit")
 
+    def test_take_profit_zero_disables_take_profit_exit(self):
+        pos = PaperPosition(entry_ts=1, entry_price=0.70, shares=1.42, size_usd=1.0, reason="test")
+        ok, reason = should_exit(cfg(take_profit=0.0), pos, book(bid=0.86), btc_price=115.0, remaining_seconds=120)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "hold")
+
+    def test_exit_stop_loss(self):
+        pos = PaperPosition(entry_ts=1, entry_price=0.70, shares=1.42, size_usd=1.0, reason="test")
+        ok, reason = should_exit(cfg(), pos, book(bid=0.54), btc_price=115.0, remaining_seconds=120)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "stop_loss")
+
+    def test_exit_trailing_stop_after_price_reverses_from_peak(self):
+        pos = PaperPosition(entry_ts=1, entry_price=0.70, shares=1.42, size_usd=1.0, reason="test")
+        trailing_cfg = cfg(take_profit=0.95, trail_start=0.05, trail_distance=0.04)
+
+        ok, reason = should_exit(trailing_cfg, pos, book(bid=0.76), btc_price=115.0, remaining_seconds=120)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "hold")
+        self.assertEqual(pos.peak_bid, 0.76)
+
+        ok, reason = should_exit(trailing_cfg, pos, book(bid=0.71), btc_price=115.0, remaining_seconds=118)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "trailing_stop")
+
+    def test_trailing_stop_disabled_when_one_side_is_zero(self):
+        pos = PaperPosition(entry_ts=1, entry_price=0.70, shares=1.42, size_usd=1.0, reason="test")
+        disabled_cfg = cfg(take_profit=0.95, trail_start=0.05, trail_distance=0.0)
+
+        ok, reason = should_exit(disabled_cfg, pos, book(bid=0.76), btc_price=115.0, remaining_seconds=120)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "hold")
+
     def test_late_exit_when_target_close(self):
         pos = PaperPosition(entry_ts=1, entry_price=0.70, shares=1.42, size_usd=1.0, reason="test")
         ok, reason = should_exit(cfg(), pos, book(bid=0.70), btc_price=103.0, remaining_seconds=20)
@@ -289,10 +324,17 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(all(preset["enabled"] for preset in config["presets"]))
         self.assertEqual(config["presets"][0]["take_profit"], 0.84)
         self.assertEqual(config["presets"][0]["min_distance_usd"], 100.0)
+        self.assertEqual(config["presets"][0]["trail_start"], 0.05)
+        self.assertEqual(config["presets"][0]["trail_distance"], 0.04)
+        self.assertNotIn("hard_exit", config["presets"][0])
         self.assertEqual(config["presets"][1]["entry_min"], 0.65)
         self.assertEqual(config["presets"][1]["min_distance_usd"], 75.0)
+        self.assertEqual(config["presets"][1]["trail_start"], 0.05)
+        self.assertEqual(config["presets"][1]["trail_distance"], 0.05)
         self.assertEqual(config["presets"][2]["entry_max"], 0.72)
         self.assertEqual(config["presets"][2]["min_distance_usd"], 75.0)
+        self.assertEqual(config["presets"][2]["trail_start"], 0.08)
+        self.assertEqual(config["presets"][2]["trail_distance"], 0.06)
 
     def test_dashboard_config_accepts_custom_preset_values(self):
         config = normalize_bot_config(
@@ -306,7 +348,8 @@ class StrategyTests(unittest.TestCase):
                         "entry_max": "0.69",
                         "take_profit": "0.85",
                         "stop_loss": "0.59",
-                        "hard_exit": "0.59",
+                        "trail_start": "0.04",
+                        "trail_distance": "0.03",
                         "late_seconds": "25",
                         "min_distance_usd": "18",
                         "max_trades_per_label_per_market": "2",
@@ -316,7 +359,41 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual(len(config["presets"]), 1)
         self.assertEqual(config["presets"][0]["entry_min"], 0.64)
+        self.assertEqual(config["presets"][0]["trail_start"], 0.04)
+        self.assertEqual(config["presets"][0]["trail_distance"], 0.03)
         self.assertEqual(config["presets"][0]["max_trades_per_label_per_market"], 2)
+
+    def test_dashboard_config_allows_take_profit_zero(self):
+        config = normalize_bot_config(
+            {
+                "url": "btc-updown-5m-1",
+                "presets": [
+                    {
+                        "key": "safe",
+                        "take_profit": "0",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(config["presets"][0]["take_profit"], 0.0)
+        self.assertEqual(config["take_profit"], 0.0)
+
+    def test_normalize_presets_zeroes_trailing_when_one_value_is_zero(self):
+        presets = normalize_presets(
+            {
+                "presets": [
+                    {
+                        "key": "safe",
+                        "trail_start": "0.05",
+                        "trail_distance": "0",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(presets[0]["trail_start"], 0.0)
+        self.assertEqual(presets[0]["trail_distance"], 0.0)
 
     def test_new_run_db_path_uses_timestamp_source_and_strategy(self):
         config = normalize_bot_config({"url": "https://polymarket.com/event/btc-updown-5m-1779623400"})
@@ -414,6 +491,9 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("data-preset=\"safe\"", DASHBOARD_HTML)
         self.assertIn("data-preset=\"balanced\"", DASHBOARD_HTML)
         self.assertIn("data-preset=\"aggressive\"", DASHBOARD_HTML)
+        self.assertIn("data-preset-field=\"take_profit\" type=\"number\" min=\"0\"", DASHBOARD_HTML)
+        self.assertIn("data-preset-field=\"trail_start\"", DASHBOARD_HTML)
+        self.assertIn("data-preset-field=\"trail_distance\"", DASHBOARD_HTML)
         self.assertIn("rrMetrics", DASHBOARD_HTML)
 
     def test_dashboard_equity_chart_marks_each_trade(self):

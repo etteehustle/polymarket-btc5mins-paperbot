@@ -37,8 +37,9 @@ DEFAULT_ENTRY_MIN = 0.65
 DEFAULT_ENTRY_MAX = 0.68
 DEFAULT_TAKE_PROFIT = 0.88
 DEFAULT_STOP_LOSS = 0.58
-DEFAULT_HARD_EXIT = 0.58
 DEFAULT_LATE_SECONDS = 30
+DEFAULT_TRAIL_START = 0.0
+DEFAULT_TRAIL_DISTANCE = 0.0
 DEFAULT_MIN_DISTANCE_USD = 100.0
 DEFAULT_ENTRY_WINDOW_SECONDS = 120
 DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET = 1
@@ -54,7 +55,8 @@ DEFAULT_PRESETS = [
         "entry_max": 0.68,
         "take_profit": 0.84,
         "stop_loss": 0.60,
-        "hard_exit": 0.60,
+        "trail_start": 0.05,
+        "trail_distance": 0.04,
         "late_seconds": DEFAULT_LATE_SECONDS,
         "min_distance_usd": 100.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
@@ -67,7 +69,8 @@ DEFAULT_PRESETS = [
         "entry_max": 0.70,
         "take_profit": 0.86,
         "stop_loss": 0.58,
-        "hard_exit": 0.58,
+        "trail_start": 0.05,
+        "trail_distance": 0.05,
         "late_seconds": DEFAULT_LATE_SECONDS,
         "min_distance_usd": 75.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
@@ -80,7 +83,8 @@ DEFAULT_PRESETS = [
         "entry_max": 0.72,
         "take_profit": 0.88,
         "stop_loss": 0.56,
-        "hard_exit": 0.56,
+        "trail_start": 0.08,
+        "trail_distance": 0.06,
         "late_seconds": DEFAULT_LATE_SECONDS,
         "min_distance_usd": 75.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
@@ -113,7 +117,8 @@ class DirectionalConfig:
     entry_max: float
     take_profit: float
     stop_loss: float
-    hard_exit: float
+    trail_start: float
+    trail_distance: float
     late_seconds: int
     entry_window_seconds: int | None
     min_distance_usd: float
@@ -128,6 +133,7 @@ class PaperPosition:
     shares: float
     size_usd: float
     reason: str
+    peak_bid: float | None = None
 
 
 @dataclass
@@ -768,10 +774,13 @@ def should_exit(
 ) -> tuple[bool, str]:
     if book.bid is None:
         return False, "no_bid"
-    if book.bid >= cfg.take_profit:
+    pos.peak_bid = book.bid if pos.peak_bid is None else max(pos.peak_bid, book.bid)
+    if cfg.take_profit > 0 and book.bid >= cfg.take_profit:
         return True, "take_profit"
-    if book.bid <= cfg.hard_exit:
-        return True, "hard_exit"
+    if cfg.trail_start > 0 and cfg.trail_distance > 0 and pos.peak_bid >= pos.entry_price + cfg.trail_start:
+        trailing_stop = pos.peak_bid - cfg.trail_distance
+        if book.bid <= trailing_stop:
+            return True, "trailing_stop"
     if book.bid <= cfg.stop_loss:
         return True, "stop_loss"
     if remaining_seconds <= cfg.late_seconds:
@@ -1029,7 +1038,8 @@ def watch_url(
     entry_max: float,
     take_profit: float,
     stop_loss: float,
-    hard_exit: float,
+    trail_start: float,
+    trail_distance: float,
     late_seconds: int,
     min_distance_usd: float,
     entry_window_seconds: int,
@@ -1052,7 +1062,8 @@ def watch_url(
                 entry_max=entry_max,
                 take_profit=take_profit,
                 stop_loss=stop_loss,
-                hard_exit=hard_exit,
+                trail_start=trail_start,
+                trail_distance=trail_distance,
                 late_seconds=late_seconds,
                 min_distance_usd=min_distance_usd,
                 max_trades_per_label_per_market=max_trades_per_label_per_market,
@@ -1100,7 +1111,8 @@ def watch_url(
                     entry_max=float(preset["entry_max"]),
                     take_profit=float(preset["take_profit"]),
                     stop_loss=float(preset["stop_loss"]),
-                    hard_exit=float(preset["hard_exit"]),
+                    trail_start=float(preset["trail_start"]),
+                    trail_distance=float(preset["trail_distance"]),
                     late_seconds=int(preset["late_seconds"]),
                     entry_window_seconds=max(0, entry_window_seconds) or None,
                     min_distance_usd=float(preset["min_distance_usd"]),
@@ -1127,7 +1139,8 @@ def watch_url(
         print(
             f"  {preset['key']}: entry={float(preset['entry_min']):.2f}-{float(preset['entry_max']):.2f} "
             f"tp={float(preset['take_profit']):.2f} sl={float(preset['stop_loss']):.2f} "
-            f"hard={float(preset['hard_exit']):.2f} late={int(preset['late_seconds'])}s "
+            f"trail={float(preset['trail_start']):.2f}/{float(preset['trail_distance']):.2f} "
+            f"late={int(preset['late_seconds'])}s "
             f"dist={float(preset['min_distance_usd']):.1f} max_trades={int(preset['max_trades_per_label_per_market'])}"
         )
     print(
@@ -1248,7 +1261,8 @@ def watch_chain(
     entry_max: float,
     take_profit: float,
     stop_loss: float,
-    hard_exit: float,
+    trail_start: float,
+    trail_distance: float,
     late_seconds: int,
     min_distance_usd: float,
     entry_window_seconds: int,
@@ -1280,7 +1294,8 @@ def watch_chain(
             entry_max=entry_max,
             take_profit=take_profit,
             stop_loss=stop_loss,
-            hard_exit=hard_exit,
+            trail_start=trail_start,
+            trail_distance=trail_distance,
             late_seconds=late_seconds,
             min_distance_usd=min_distance_usd,
             entry_window_seconds=entry_window_seconds,
@@ -1535,7 +1550,6 @@ def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
         "arb": [],
         "arb_events": [],
         "health": {
-            "hard_exit_count": 0,
             "stop_loss_count": 0,
             "top_3_pnl": 0.0,
             "top_3_share": 0.0,
@@ -1600,7 +1614,7 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
                    AVG(pnl) AS avg_pnl, {win_rate_expr()} AS win_rate,
                    AVG(entry_price) AS avg_entry, AVG(exit_price) AS avg_exit,
                    MIN(pnl) AS worst, MAX(pnl) AS best,
-                   SUM(CASE WHEN exit_reason IN ('hard_exit', 'stop_loss') THEN 1 ELSE 0 END) AS risk_exits
+                   SUM(CASE WHEN exit_reason = 'stop_loss' THEN 1 ELSE 0 END) AS risk_exits
             FROM paper_trades
             GROUP BY preset_key
             ORDER BY pnl DESC
@@ -1631,7 +1645,7 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
                    COUNT(*) AS trades, SUM(pnl) AS pnl,
                    AVG(pnl) AS avg_pnl, {win_rate_expr()} AS win_rate,
                    AVG(entry_price) AS avg_entry, AVG(exit_price) AS avg_exit,
-                   SUM(CASE WHEN exit_reason IN ('hard_exit', 'stop_loss') THEN 1 ELSE 0 END) AS risk_exits
+                   SUM(CASE WHEN exit_reason = 'stop_loss' THEN 1 ELSE 0 END) AS risk_exits
             FROM paper_trades
             GROUP BY outcome, preset_key
             ORDER BY pnl DESC
@@ -1750,12 +1764,10 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     for event in arb_events:
         event["time"] = iso(int(event["ts"])) if event["ts"] else ""
 
-    hard_exit_count = sum(int(row["trades"]) for row in exits if row["exit_reason"] == "hard_exit")
     stop_loss_count = sum(int(row["trades"]) for row in exits if row["exit_reason"] == "stop_loss")
     top_pnl = con.execute("SELECT pnl FROM paper_trades ORDER BY pnl DESC LIMIT 3").fetchall()
     top_sum = sum(float(row["pnl"]) for row in top_pnl)
     health = {
-        "hard_exit_count": hard_exit_count,
         "stop_loss_count": stop_loss_count,
         "top_3_pnl": top_sum,
         "top_3_share": (top_sum / overall["pnl"] * 100.0) if overall["pnl"] else 0.0,
@@ -1851,7 +1863,8 @@ def normalize_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
         "entry_max",
         "take_profit",
         "stop_loss",
-        "hard_exit",
+        "trail_start",
+        "trail_distance",
         "late_seconds",
         "min_distance_usd",
         "max_trades_per_label_per_market",
@@ -1861,9 +1874,10 @@ def normalize_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
             single_preset_from_args(
                 entry_min=bounded_float(payload.get("entry_min"), DEFAULT_ENTRY_MIN, 0.01, 0.99),
                 entry_max=bounded_float(payload.get("entry_max"), DEFAULT_ENTRY_MAX, 0.01, 0.99),
-                take_profit=bounded_float(payload.get("take_profit"), DEFAULT_TAKE_PROFIT, 0.01, 0.99),
+                take_profit=bounded_float(payload.get("take_profit"), DEFAULT_TAKE_PROFIT, 0.0, 0.99),
                 stop_loss=bounded_float(payload.get("stop_loss"), DEFAULT_STOP_LOSS, 0.01, 0.99),
-                hard_exit=bounded_float(payload.get("hard_exit"), DEFAULT_HARD_EXIT, 0.01, 0.99),
+                trail_start=bounded_float(payload.get("trail_start"), DEFAULT_TRAIL_START, 0.0, 0.99),
+                trail_distance=bounded_float(payload.get("trail_distance"), DEFAULT_TRAIL_DISTANCE, 0.0, 0.99),
                 late_seconds=bounded_int(payload.get("late_seconds"), DEFAULT_LATE_SECONDS, 0, 300),
                 min_distance_usd=bounded_float(payload.get("min_distance_usd"), DEFAULT_MIN_DISTANCE_USD, 0.0, 100_000.0),
                 max_trades_per_label_per_market=bounded_int(
@@ -1886,15 +1900,17 @@ def normalize_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
             key = f"{key}_{index + 1}"
         used.add(key)
         fallback = by_key.get(raw_key, defaults[min(index, len(defaults) - 1)])
+        trail_start, trail_distance = normalized_trailing_pair(item, fallback)
         preset = {
             "key": key,
             "name": str(item.get("name") or fallback.get("name") or key).strip() or key,
             "enabled": bool_value(item.get("enabled"), bool(fallback.get("enabled", True))),
             "entry_min": bounded_float(item.get("entry_min"), float(fallback["entry_min"]), 0.01, 0.99),
             "entry_max": bounded_float(item.get("entry_max"), float(fallback["entry_max"]), 0.01, 0.99),
-            "take_profit": bounded_float(item.get("take_profit"), float(fallback["take_profit"]), 0.01, 0.99),
+            "take_profit": bounded_float(item.get("take_profit"), float(fallback["take_profit"]), 0.0, 0.99),
             "stop_loss": bounded_float(item.get("stop_loss"), float(fallback["stop_loss"]), 0.01, 0.99),
-            "hard_exit": bounded_float(item.get("hard_exit"), float(fallback["hard_exit"]), 0.01, 0.99),
+            "trail_start": trail_start,
+            "trail_distance": trail_distance,
             "late_seconds": bounded_int(item.get("late_seconds"), int(fallback["late_seconds"]), 0, 300),
             "min_distance_usd": bounded_float(
                 item.get("min_distance_usd"),
@@ -1915,6 +1931,26 @@ def normalize_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return presets
 
 
+def normalized_trailing_pair(item: dict[str, Any], fallback: dict[str, Any]) -> tuple[float, float]:
+    start_provided = item.get("trail_start") not in (None, "")
+    distance_provided = item.get("trail_distance") not in (None, "")
+    start = bounded_float(
+        item.get("trail_start"),
+        float(fallback.get("trail_start", DEFAULT_TRAIL_START)),
+        0.0,
+        0.99,
+    )
+    distance = bounded_float(
+        item.get("trail_distance"),
+        float(fallback.get("trail_distance", DEFAULT_TRAIL_DISTANCE)),
+        0.0,
+        0.99,
+    )
+    if start <= 0 or distance <= 0 or start_provided != distance_provided:
+        return 0.0, 0.0
+    return start, distance
+
+
 def primary_preset(config: dict[str, Any]) -> dict[str, Any]:
     presets = config.get("presets") or DEFAULT_PRESETS
     for preset in presets:
@@ -1928,11 +1964,15 @@ def single_preset_from_args(
     entry_max: float,
     take_profit: float,
     stop_loss: float,
-    hard_exit: float,
+    trail_start: float,
+    trail_distance: float,
     late_seconds: int,
     min_distance_usd: float,
     max_trades_per_label_per_market: int,
 ) -> dict[str, Any]:
+    if trail_start <= 0 or trail_distance <= 0:
+        trail_start = 0.0
+        trail_distance = 0.0
     return {
         "key": "custom",
         "name": "Custom",
@@ -1941,7 +1981,8 @@ def single_preset_from_args(
         "entry_max": entry_max,
         "take_profit": take_profit,
         "stop_loss": stop_loss,
-        "hard_exit": hard_exit,
+        "trail_start": trail_start,
+        "trail_distance": trail_distance,
         "late_seconds": late_seconds,
         "min_distance_usd": min_distance_usd,
         "max_trades_per_label_per_market": max_trades_per_label_per_market,
@@ -1989,7 +2030,7 @@ def strategy_label(config: dict[str, Any]) -> str:
         f"{preset_part}_e{compact_number(preset.get('entry_min'))}-{compact_number(preset.get('entry_max'))}"
         f"_tp{compact_number(preset.get('take_profit'))}"
         f"_sl{compact_number(preset.get('stop_loss'))}"
-        f"_hard{compact_number(preset.get('hard_exit'))}"
+        f"_tr{compact_number(preset.get('trail_start'))}-{compact_number(preset.get('trail_distance'))}"
         f"_dist{compact_number(preset.get('min_distance_usd'), 1)}"
         f"_cut{config.get('no_entry_after_seconds')}"
         f"_sum{compact_number(config.get('max_sum_asks'))}"
@@ -2155,8 +2196,10 @@ def bot_command(config: dict[str, Any], db_path: Path) -> list[str]:
         str(preset["take_profit"]),
         "--stop-loss",
         str(preset["stop_loss"]),
-        "--hard-exit",
-        str(preset["hard_exit"]),
+        "--trail-start",
+        str(preset["trail_start"]),
+        "--trail-distance",
+        str(preset["trail_distance"]),
         "--late-seconds",
         str(preset["late_seconds"]),
         "--min-distance-usd",
@@ -2206,7 +2249,8 @@ def normalize_bot_config(payload: dict[str, Any]) -> dict[str, Any]:
         "entry_max": preset["entry_max"],
         "take_profit": preset["take_profit"],
         "stop_loss": preset["stop_loss"],
-        "hard_exit": preset["hard_exit"],
+        "trail_start": preset["trail_start"],
+        "trail_distance": preset["trail_distance"],
         "late_seconds": preset["late_seconds"],
         "min_distance_usd": preset["min_distance_usd"],
         "presets": presets,
@@ -2519,9 +2563,6 @@ DASHBOARD_HTML_OLD = r"""<!doctype html>
               </label>
               <label>Cắt lỗ
                 <input id="stop_loss" name="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58">
-              </label>
-              <label>Thoát cứng
-                <input id="hard_exit" name="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.58">
               </label>
               <label>Giây late exit
                 <input id="late_seconds" name="late_seconds" type="number" min="0" max="300" step="1" value="30">
@@ -2861,7 +2902,6 @@ DASHBOARD_HTML_OLD = r"""<!doctype html>
       ], activeRows, 'Không có lệnh đang mở');
       drawEquity(data.equity);
       document.getElementById('health').innerHTML = `
-        <p><span class="pill">Thoát cứng</span> ${data.health.hard_exit_count}</p>
         <p><span class="pill">Cắt lỗ</span> ${data.health.stop_loss_count}</p>
         <p><span class="pill">Lỗ lớn nhất</span> ${money(data.health.largest_loss)}</p>
         <p><span class="pill">Tỷ trọng top 3 PnL</span> ${pct(data.health.top_3_share)}</p>
@@ -2953,7 +2993,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .risk-grid{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-top:12px}
     .checkline{display:flex;align-items:center;gap:8px;min-height:34px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#0e1413;color:var(--ink)}
     .checkline input{width:16px;min-height:16px;accent-color:var(--accent)}
-    .preset-board{display:grid;gap:10px;margin-top:12px}.preset-row{display:grid;grid-template-columns:96px repeat(8,minmax(62px,1fr)) minmax(100px,.9fr);gap:8px;align-items:end;border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0e1413}
+    .preset-board{display:grid;gap:10px;margin-top:12px}.preset-row{display:grid;grid-template-columns:96px repeat(9,minmax(58px,1fr)) minmax(100px,.9fr);gap:8px;align-items:end;border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0e1413}
     .preset-row[data-preset=safe]{border-left-color:var(--good)}.preset-row[data-preset=balanced]{border-left-color:var(--warn)}.preset-row[data-preset=aggressive]{border-left-color:var(--bad)}
     .preset-title{display:grid;gap:6px;align-self:center}.preset-title label{display:flex;align-items:center;gap:8px;color:var(--ink)}.preset-title input{width:16px;min-height:16px;accent-color:var(--accent)}
     .rr-box{display:grid;gap:3px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#101815}.rr-box strong{font-size:15px}.rr-box.good strong{color:var(--good)}.rr-box.thin strong{color:var(--warn)}.rr-box.bad strong{color:var(--bad)}
@@ -2977,9 +3017,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   <main>
     <section id="run"><div class="grid run-grid"><form id="runForm" class="grid"><div class="panel"><h2>Run setup</h2><div class="setup-grid"><label>URL hoac slug Polymarket<input id="url" name="url" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required></label><label>So keo noi tiep<input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="6"></label><label>Giay moi lan quet<input id="poll" name="poll" type="number" min="1" max="60" step="1" value="2"></label><label>Size paper USD<input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1"></label><label>Giay chay override<input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Tu dong"></label></div><div class="risk-grid"><label>Khong vao sau giay<input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="0"></label><label>Tong ask toi da<input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03"></label><label>Chi vao khi con <= giay<input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="120"></label><label>Buffer arb<input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.01"></label><label>Fee du phong<input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07"></label><label>Giay giua cac keo<input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300"></label><label>Timeout tim keo<input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60"></label><label>Giay dem ket thuc<input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1"></label><input type="hidden" name="market_lock_after_loss" value="false"><label class="checkline"><input id="market_lock_after_loss" name="market_lock_after_loss" type="checkbox" value="true" checked><span>Khoa market sau lenh lo</span></label></div></div>
     <div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Preset strategy matrix</h2><span class="subtle">R:R cap nhat realtime theo entry / TP / SL</span></div><div class="preset-board" id="presetBoard">
-      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>An toan</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.84"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="100"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Can bang</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Hard<input data-preset-field="hard_exit" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>An toan</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.84"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.04"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="100"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Can bang</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.08"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.06"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
     </div><div class="command-row" style="margin-top:12px"><button class="primary" id="startBtn" type="submit">Chay bot</button><button id="stopBtn" type="button">Dung bot</button><button class="danger" id="resetBtn" type="button">Xoa du lieu</button><button id="closeAppBtn" type="button">Dong app</button></div><div class="notice" id="controlNotice">San sang.</div></div></form><div class="panel terminal-panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Nhat ky</h2><span class="pill" id="pidPill">Chua chay</span></div><pre class="terminal" id="terminal">Dang cho log bot...</pre></div></div></section>
     <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Suc khoe chien luoc</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Lenh dang mo</h2><span class="pill" id="activeOverviewCount">0 lenh</span></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Theo market</h2><div class="table-scroll"><table id="markets"></table></div></div><div class="panel"><h2>Theo outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div></div></section>
     <section id="trades" class="hidden"><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Trade journal</h2><div class="toolbar"><input id="filter" placeholder="Loc market, outcome, ly do"><select id="presetFilter"><option value="all">Tat ca preset</option></select><select id="resultFilter"><option value="all">Tat ca lenh</option><option value="wins">Lenh lai</option><option value="losses">Lenh lo</option></select></div></div><div class="table-scroll"><table id="tradesTable"></table></div></div></section>
@@ -2992,16 +3032,17 @@ DASHBOARD_HTML = r"""<!doctype html>
     const fmt=(n,d=4)=>Number(n||0).toFixed(d),cls=n=>Number(n||0)>=0?'pos':'neg',money=n=>`<span class="${cls(n)}">${Number(n||0)>=0?'+':''}${fmt(n)}</span>`,pct=n=>`${Number(n||0).toFixed(1)}%`;
     const esc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])),valueMaybe=(n,d=2)=>n===null||n===undefined?'<span class="subtle">n/a</span>':fmt(n,d);
     function presetChip(row){const key=row.preset_key||row.key||'legacy';return `<span class="pill preset-chip ${esc(key)}">${esc(row.preset_name||presetNames[key]||key)}</span>`}
-    function rrMetrics(p){const min=Number(p.entry_min),max=Number(p.entry_max),tp=Number(p.take_profit),sl=Number(p.stop_loss),mid=(min+max)/2,rr=entry=>entry>sl?(tp-entry)/(entry-sl):NaN;return{avg:rr(mid),worst:rr(max),best:rr(min)}}
+    function rrMetrics(p){const min=Number(p.entry_min),max=Number(p.entry_max),tp=Number(p.take_profit),sl=Number(p.stop_loss),mid=(min+max)/2;if(tp<=0)return{avg:NaN,worst:NaN,best:NaN,tpOff:true};const rr=entry=>entry>sl?(tp-entry)/(entry-sl):NaN;return{avg:rr(mid),worst:rr(max),best:rr(min),tpOff:false}}
     function rrClass(worst){if(!Number.isFinite(worst)||worst<1)return'bad';if(worst<1.5)return'thin';return'good'}
-    function collectPresets(){return[...document.querySelectorAll('.preset-row')].map(row=>{const key=row.dataset.preset,get=field=>row.querySelector(`[data-preset-field="${field}"]`);return{key,name:row.querySelector('h3').textContent.trim(),enabled:get('enabled').checked,entry_min:get('entry_min').value,entry_max:get('entry_max').value,take_profit:get('take_profit').value,stop_loss:get('stop_loss').value,hard_exit:get('hard_exit').value,late_seconds:get('late_seconds').value,min_distance_usd:get('min_distance_usd').value,max_trades_per_label_per_market:get('max_trades_per_label_per_market').value}})}
-    function updatePresetRisk(){for(const row of document.querySelectorAll('.preset-row')){const preset=collectPresets().find(item=>item.key===row.dataset.preset),rr=rrMetrics(preset),box=row.querySelector('[data-rr-box]');box.className=`rr-box ${rrClass(rr.worst)}`;box.innerHTML=`<strong>${Number.isFinite(rr.avg)?rr.avg.toFixed(2)+'R':'Invalid'}</strong><span class="subtle">Worst ${Number.isFinite(rr.worst)?rr.worst.toFixed(2)+'R':'Invalid'} / Best ${Number.isFinite(rr.best)?rr.best.toFixed(2)+'R':'Invalid'}</span>`}}
+    function collectPresets(){return[...document.querySelectorAll('.preset-row')].map(row=>{const key=row.dataset.preset,get=field=>row.querySelector(`[data-preset-field="${field}"]`);let trailStart=get('trail_start').value,trailDistance=get('trail_distance').value;if(Number(trailStart)<=0||Number(trailDistance)<=0){trailStart='0';trailDistance='0'}return{key,name:row.querySelector('h3').textContent.trim(),enabled:get('enabled').checked,entry_min:get('entry_min').value,entry_max:get('entry_max').value,take_profit:get('take_profit').value,stop_loss:get('stop_loss').value,trail_start:trailStart,trail_distance:trailDistance,late_seconds:get('late_seconds').value,min_distance_usd:get('min_distance_usd').value,max_trades_per_label_per_market:get('max_trades_per_label_per_market').value}})}
+    function updatePresetRisk(){for(const row of document.querySelectorAll('.preset-row')){const preset=collectPresets().find(item=>item.key===row.dataset.preset),rr=rrMetrics(preset),box=row.querySelector('[data-rr-box]');box.className=`rr-box ${rr.tpOff?'thin':rrClass(rr.worst)}`;box.innerHTML=rr.tpOff?'<strong>TP off</strong><span class="subtle">Trailing / SL quan ly exit</span>':`<strong>${Number.isFinite(rr.avg)?rr.avg.toFixed(2)+'R':'Invalid'}</strong><span class="subtle">Worst ${Number.isFinite(rr.worst)?rr.worst.toFixed(2)+'R':'Invalid'} / Best ${Number.isFinite(rr.best)?rr.best.toFixed(2)+'R':'Invalid'}</span>`}}
     function activePositionCell(r){return`<div class="stacked"><strong>${presetChip(r)} ${esc(r.market_slug||'n/a')} ${esc(r.outcome||'')}</strong><span class="subtle">Size ${valueMaybe(r.size_usd,2)} | Shares ${valueMaybe(r.shares,4)} | Entry ${valueMaybe(r.entry_price,2)}</span><span class="subtle">Giu ${Number(r.hold_seconds||0)}s</span></div>`}
     function activePriceCell(r){return`<div class="stacked"><strong>${valueMaybe(r.bid,2)}</strong><span class="subtle">Ask ${valueMaybe(r.ask,2)}</span></div>`}
     function activePnlCell(r){if(r.unrealized_pnl===null||r.unrealized_pnl===undefined)return'<span class="subtle">n/a</span>';const roi=r.unrealized_roi===null||r.unrealized_roi===undefined?'n/a':pct(r.unrealized_roi);return`<span class="${cls(r.unrealized_pnl)}"><strong>${Number(r.unrealized_pnl)>=0?'+':''}${fmt(r.unrealized_pnl)}</strong><br>${roi}</span>`}
     function setTab(name){document.querySelectorAll('main > section').forEach(el=>el.classList.toggle('hidden',el.id!==name));document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.dataset.tab===name))}
     document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>setTab(btn.dataset.tab)));
-    document.getElementById('runForm').addEventListener('input',()=>{if(!bot?.running)formDirty=true;updatePresetRisk()});document.getElementById('runForm').addEventListener('change',()=>{if(!bot?.running)formDirty=true;updatePresetRisk()});
+    function normalizeTrailingInput(event){const input=event.target;if(!input.matches('[data-preset-field="trail_start"],[data-preset-field="trail_distance"]'))return;const row=input.closest('.preset-row'),start=row.querySelector('[data-preset-field="trail_start"]'),distance=row.querySelector('[data-preset-field="trail_distance"]');if(Number(input.value)<=0){start.value='0';distance.value='0'}}
+    document.getElementById('runForm').addEventListener('input',event=>{normalizeTrailingInput(event);if(!bot?.running)formDirty=true;updatePresetRisk()});document.getElementById('runForm').addEventListener('change',event=>{normalizeTrailingInput(event);if(!bot?.running)formDirty=true;updatePresetRisk()});
     function table(id,headers,rows,empty='Chua co du lieu'){const el=document.getElementById(id);if(!rows.length){el.innerHTML=`<tr><td class="empty">${empty}</td></tr>`;return}el.innerHTML=`<thead><tr>${headers.map(h=>`<th>${h[0]}</th>`).join('')}</tr></thead><tbody>`+rows.map(row=>`<tr>${headers.map(h=>`<td>${h[1](row)}</td>`).join('')}</tr>`).join('')+'</tbody>'}
     function drawEquity(rows){const svg=document.getElementById('equity'),w=svg.clientWidth||900,h=svg.clientHeight||280,p=28;if(!rows.length){svg.innerHTML='<text x="50%" y="50%" text-anchor="middle" fill="#91a09b">Chua co lenh da dong</text>';return}const ys=rows.map(r=>Number(r.cumulative)),minY=Math.min(0,...ys),maxY=Math.max(0,...ys),span=Math.max(.0001,maxY-minY),grouped={};for(const row of rows)(grouped[row.preset_key||'legacy']||=[]).push(row);const all=rows.slice().sort((a,b)=>Number(a.ts)-Number(b.ts)),indexOf=new Map(all.map((r,i)=>[r,i])),x=row=>p+(all.length===1?0:indexOf.get(row)*(w-p*2)/(all.length-1)),y=v=>h-p-((v-minY)/span)*(h-p*2),zero=y(0);const lines=Object.entries(grouped).map(([key,items])=>`<polyline points="${items.map(r=>`${x(r)},${y(Number(r.cumulative))}`).join(' ')}" fill="none" stroke="${presetColors[key]||'#7bb7ff'}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>`).join(''),markers=rows.map(r=>`<circle cx="${x(r)}" cy="${y(Number(r.cumulative))}" r="4.5" fill="${Number(r.pnl)>=0?'#4fd18b':'#ef735f'}" stroke="#0b0f0e" stroke-width="1.5"><title>${esc(r.preset_name||r.preset_key||'preset')} | ${esc(r.market_slug||'n/a')} | PnL ${Number(r.pnl)>=0?'+':''}${fmt(r.pnl)}</title></circle>`).join('');svg.setAttribute('viewBox',`0 0 ${w} ${h}`);svg.innerHTML=`<line x1="${p}" x2="${w-p}" y1="${zero}" y2="${zero}" stroke="#2a3633"/>${lines}${markers}`}
     function logClass(line){if(/stderr|fetch\/error|HTTP Error|Traceback|Error:/i.test(line))return'log-error';if(/Market target price:/i.test(line))return'log-target';if(/PAPER ENTER| ENTER /.test(line))return'log-enter';if(/PAPER EXIT| EXIT /.test(line))return'log-exit';if(/ARB /.test(line))return'log-arb';if(/ HOLD /.test(line))return'log-hold';if(/ WATCH |watch bid=|tick complete/.test(line))return'log-watch';if(/started|Slug:|Market end:|Watcher end:|Outcomes:|Strategies:|No wallet/.test(line))return'log-start';if(/ended|Paper trades|Arb events|No paper trades|No arb events|summary/i.test(line))return'log-end';if(/^\s*$/.test(line))return'log-muted';return'log-line'}
@@ -3019,7 +3060,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     function plannedRR(row){const p=presetConfigByKey()[row.preset_key];if(!p)return'<span class="subtle">n/a</span>';const rr=rrMetrics(p);return Number.isFinite(rr.avg)?`${rr.avg.toFixed(2)}R`:'<span class="neg">Invalid</span>'}
     function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">Tat ca preset</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all'}
     function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">BTC ${valueMaybe(latest?.btc_price,2)} | ${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
-    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Thoat cung</span> ${data.health.hard_exit_count}</p><p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['BTC',r=>valueMaybe(r.btc_price,2)]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
+    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['BTC',r=>valueMaybe(r.btc_price,2)]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
     function renderTrades(){if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,rows=state.trades.filter(r=>{const hay=`${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason} ${r.preset_name}`.toLowerCase();if(q&&!hay.includes(q))return false;if(presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true});table('tradesTable',[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Vao',r=>r.entry_time],['Thoat',r=>r.exit_time],['Giu',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],rows,'Khong co lenh phu hop')}
     document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
     async function refresh(){const res=await fetch('/api/dashboard',{cache:'no-store'});render(await res.json())}
@@ -3136,7 +3177,8 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--entry-max", type=float, default=DEFAULT_ENTRY_MAX)
     auto.add_argument("--take-profit", type=float, default=DEFAULT_TAKE_PROFIT)
     auto.add_argument("--stop-loss", type=float, default=DEFAULT_STOP_LOSS)
-    auto.add_argument("--hard-exit", type=float, default=DEFAULT_HARD_EXIT)
+    auto.add_argument("--trail-start", type=float, default=DEFAULT_TRAIL_START, help="Arm trailing after bid moves this much above entry. Use 0 to disable.")
+    auto.add_argument("--trail-distance", type=float, default=DEFAULT_TRAIL_DISTANCE, help="Exit when bid falls this much from peak after trailing is armed. Use 0 to disable.")
     auto.add_argument("--late-seconds", type=int, default=DEFAULT_LATE_SECONDS)
     auto.add_argument("--min-distance-usd", type=float, default=DEFAULT_MIN_DISTANCE_USD)
     auto.add_argument(
@@ -3177,7 +3219,8 @@ def build_parser() -> argparse.ArgumentParser:
     directional.add_argument("--entry-max", type=float, default=0.72)
     directional.add_argument("--take-profit", type=float, default=0.85)
     directional.add_argument("--stop-loss", type=float, default=0.55)
-    directional.add_argument("--hard-exit", type=float, default=0.50)
+    directional.add_argument("--trail-start", type=float, default=DEFAULT_TRAIL_START, help="Arm trailing after bid moves this much above entry. Use 0 to disable.")
+    directional.add_argument("--trail-distance", type=float, default=DEFAULT_TRAIL_DISTANCE, help="Exit when bid falls this much from peak after trailing is armed. Use 0 to disable.")
     directional.add_argument("--late-seconds", type=int, default=30)
     directional.add_argument("--entry-window-seconds", type=int, default=0, help="Only enter with this many seconds or less remaining. Use 0 to disable.")
     directional.add_argument("--min-distance-usd", type=float, default=50.0)
@@ -3230,7 +3273,8 @@ def main(argv: list[str] | None = None) -> int:
                 entry_max=args.entry_max,
                 take_profit=args.take_profit,
                 stop_loss=args.stop_loss,
-                hard_exit=args.hard_exit,
+                trail_start=args.trail_start if args.trail_start > 0 and args.trail_distance > 0 else 0.0,
+                trail_distance=args.trail_distance if args.trail_start > 0 and args.trail_distance > 0 else 0.0,
                 late_seconds=args.late_seconds,
                 entry_window_seconds=max(0, args.entry_window_seconds) or None,
                 min_distance_usd=args.min_distance_usd,
@@ -3271,7 +3315,8 @@ def main(argv: list[str] | None = None) -> int:
                     entry_max=args.entry_max,
                     take_profit=args.take_profit,
                     stop_loss=args.stop_loss,
-                    hard_exit=args.hard_exit,
+                    trail_start=args.trail_start,
+                    trail_distance=args.trail_distance,
                     late_seconds=args.late_seconds,
                     min_distance_usd=args.min_distance_usd,
                     entry_window_seconds=max(0, args.entry_window_seconds),
@@ -3296,7 +3341,8 @@ def main(argv: list[str] | None = None) -> int:
                     entry_max=args.entry_max,
                     take_profit=args.take_profit,
                     stop_loss=args.stop_loss,
-                    hard_exit=args.hard_exit,
+                    trail_start=args.trail_start,
+                    trail_distance=args.trail_distance,
                     late_seconds=args.late_seconds,
                     min_distance_usd=args.min_distance_usd,
                     entry_window_seconds=max(0, args.entry_window_seconds),
