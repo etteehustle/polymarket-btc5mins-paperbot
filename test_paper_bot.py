@@ -497,6 +497,49 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(row[4], 77123.45)
         self.assertIsNone(row[5])
 
+    def test_write_latest_state_upserts_by_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                first_book = BookTop(
+                    bid=0.60,
+                    bid_size=100,
+                    ask=0.62,
+                    ask_size=100,
+                    last=0.61,
+                    raw={},
+                    updated_ms=1_000,
+                    source="polymarket_ws_book",
+                )
+                second_book = BookTop(
+                    bid=0.63,
+                    bid_size=90,
+                    ask=0.65,
+                    ask_size=80,
+                    last=0.64,
+                    raw={},
+                    updated_ms=2_000,
+                    source="polymarket_ws_price_change",
+                )
+                first_price = paper_bot.PriceSnapshot(77100.0, 1, 1_500, "polymarket_rtds_chainlink")
+                second_price = paper_bot.PriceSnapshot(77200.0, 2, 2_500, "polymarket_rtds_chainlink")
+                clock = ClockSnapshot(unix_ts=1_300, source="polymarket", synced_age_seconds=1)
+
+                paper_bot.write_latest_state(con, "btc-updown-5m-1000", "Up", "token", first_book, first_price, clock, 10)
+                paper_bot.write_latest_state(con, "btc-updown-5m-1000", "Up", "token", second_book, second_price, clock, 9)
+
+                rows = con.execute("SELECT token_id, bid, ask, btc_price, remaining_seconds FROM latest_state").fetchall()
+            finally:
+                con.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "token")
+        self.assertEqual(rows[0][1], 0.63)
+        self.assertEqual(rows[0][2], 0.65)
+        self.assertEqual(rows[0][3], 77200.0)
+        self.assertEqual(rows[0][4], 9)
+
     def test_record_arb_event_compacts_raw_orderbook_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "paper.sqlite"
@@ -987,6 +1030,11 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("activePnlCell", DASHBOARD_HTML)
         self.assertIn("['PnL',activePnlCell]", DASHBOARD_HTML)
 
+    def test_dashboard_html_polls_realtime_endpoint_between_full_refreshes(self):
+        self.assertIn("/api/realtime", DASHBOARD_HTML)
+        self.assertIn("refreshRealtime", DASHBOARD_HTML)
+        self.assertIn("setInterval(refreshRealtime,500)", DASHBOARD_HTML)
+
     def test_dashboard_html_includes_preset_matrix_and_rr(self):
         self.assertIn("presetBoard", DASHBOARD_HTML)
         self.assertIn("data-preset=\"safe\"", DASHBOARD_HTML)
@@ -1050,6 +1098,99 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(payload["market_reference"]["current_price_source"], "snapshot")
         self.assertIn("price_age_ms", payload["market_reference"])
         self.assertEqual(payload["market_reference"]["time_source"], "local_fallback")
+
+    def test_dashboard_payload_prefers_latest_state_over_history_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-new",
+                    "title": "new",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                paper_bot.save_snapshot(con, "btc-updown-5m-new Up preset:safe", "old-token", book(bid=0.60, ask=0.62), btc_price=77111.0)
+                latest_book = BookTop(
+                    bid=0.70,
+                    bid_size=90,
+                    ask=0.72,
+                    ask_size=80,
+                    last=0.71,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="polymarket_ws_price_change",
+                )
+                latest_price = paper_bot.PriceSnapshot(
+                    price=77222.0,
+                    timestamp_ms=1,
+                    received_ms=paper_bot.now_ms(),
+                    source="polymarket_rtds_chainlink",
+                )
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, "btc-updown-5m-new", "Up", "new-token", latest_book, latest_price, clock, 42)
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertEqual(payload["market_reference"]["current_price"], 77222.0)
+        self.assertEqual(payload["market_reference"]["current_price_source"], "polymarket_rtds_chainlink")
+        self.assertEqual(payload["market_reference"]["remaining_seconds"], 42)
+        self.assertEqual(payload["snapshots"][0]["bid"], 0.70)
+        self.assertEqual(payload["snapshots"][0]["source"], "polymarket_ws_price_change")
+
+    def test_dashboard_realtime_payload_uses_latest_state_without_reference_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-new",
+                    "title": "new",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                latest_book = BookTop(
+                    bid=0.70,
+                    bid_size=90,
+                    ask=0.72,
+                    ask_size=80,
+                    last=0.71,
+                    raw={},
+                    updated_ms=paper_bot.now_ms(),
+                    source="polymarket_ws_price_change",
+                )
+                latest_price = paper_bot.PriceSnapshot(
+                    price=77222.0,
+                    timestamp_ms=1,
+                    received_ms=paper_bot.now_ms(),
+                    source="polymarket_rtds_chainlink",
+                )
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(con, "btc-updown-5m-new", "Up", "new-token", latest_book, latest_price, clock, 42)
+            finally:
+                con.close()
+
+            with patch("paper_bot.fetch_reference_price_snapshot") as fetch_price:
+                payload = paper_bot.dashboard_realtime_payload(db_path)
+
+        fetch_price.assert_not_called()
+        self.assertEqual(payload["market_reference"]["current_price"], 77222.0)
+        self.assertEqual(payload["market_reference"]["remaining_seconds"], 42)
+        self.assertEqual(payload["snapshots"][0]["bid"], 0.70)
 
     def test_dashboard_payload_falls_back_to_polymarket_rtds_current_price(self):
         with tempfile.TemporaryDirectory() as tmp:

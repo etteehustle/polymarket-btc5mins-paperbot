@@ -1365,6 +1365,30 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS latest_state (
+            token_id TEXT PRIMARY KEY,
+            market_slug TEXT,
+            outcome TEXT,
+            ts INTEGER NOT NULL,
+            bid REAL,
+            ask REAL,
+            last REAL,
+            bid_size REAL,
+            ask_size REAL,
+            book_updated_ms INTEGER,
+            book_source TEXT,
+            btc_price REAL,
+            btc_received_ms INTEGER,
+            btc_source TEXT,
+            clock_ts INTEGER,
+            clock_source TEXT,
+            clock_age_seconds INTEGER,
+            remaining_seconds INTEGER
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS paper_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             strategy TEXT NOT NULL,
@@ -1529,6 +1553,66 @@ def save_snapshot(
             book.ask_size,
             btc_price,
             snapshot_raw_json(book),
+        ),
+    )
+    con.commit()
+
+
+def write_latest_state(
+    con: sqlite3.Connection,
+    market_slug: str | None,
+    outcome: str | None,
+    token_id: str,
+    book: BookTop,
+    btc_snapshot: PriceSnapshot | None,
+    clock_snapshot: ClockSnapshot | None,
+    remaining_seconds: int | None,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO latest_state
+        (token_id, market_slug, outcome, ts, bid, ask, last, bid_size, ask_size,
+         book_updated_ms, book_source, btc_price, btc_received_ms, btc_source,
+         clock_ts, clock_source, clock_age_seconds, remaining_seconds)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(token_id) DO UPDATE SET
+            market_slug=excluded.market_slug,
+            outcome=excluded.outcome,
+            ts=excluded.ts,
+            bid=excluded.bid,
+            ask=excluded.ask,
+            last=excluded.last,
+            bid_size=excluded.bid_size,
+            ask_size=excluded.ask_size,
+            book_updated_ms=excluded.book_updated_ms,
+            book_source=excluded.book_source,
+            btc_price=excluded.btc_price,
+            btc_received_ms=excluded.btc_received_ms,
+            btc_source=excluded.btc_source,
+            clock_ts=excluded.clock_ts,
+            clock_source=excluded.clock_source,
+            clock_age_seconds=excluded.clock_age_seconds,
+            remaining_seconds=excluded.remaining_seconds
+        """,
+        (
+            str(token_id),
+            market_slug,
+            outcome,
+            utc_now(),
+            book.bid,
+            book.ask,
+            book.last,
+            book.bid_size,
+            book.ask_size,
+            book.updated_ms,
+            book.source,
+            btc_snapshot.price if btc_snapshot else None,
+            btc_snapshot.received_ms if btc_snapshot else None,
+            btc_snapshot.source if btc_snapshot else None,
+            clock_snapshot.unix_ts if clock_snapshot else None,
+            clock_snapshot.source if clock_snapshot else None,
+            clock_snapshot.synced_age_seconds if clock_snapshot else None,
+            remaining_seconds,
         ),
     )
     con.commit()
@@ -1849,6 +1933,7 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
             book = book_client.get_books([cfg.token_id])[cfg.token_id]
             btc_snapshot = fetch_reference_price_snapshot(cfg.resolution_source) if needs_reference else None
             btc = btc_snapshot.price if btc_snapshot else None
+            write_latest_state(con, cfg.market_slug, cfg.outcome, cfg.token_id, book, btc_snapshot, clock_snapshot, remaining)
             if snapshots.allow(f"{cfg.label}:{cfg.token_id}", now_ts):
                 save_snapshot(con, cfg.label, cfg.token_id, book, btc)
             if position is None:
@@ -1919,6 +2004,9 @@ def watch_arb(
             books = book_client.get_books([yes_token_id, no_token_id])
             yes = books[yes_token_id]
             no = books[no_token_id]
+            remaining = max(0, end_ts - now_ts)
+            write_latest_state(con, None, "Yes", yes_token_id, yes, None, None, remaining)
+            write_latest_state(con, None, "No", no_token_id, no, None, None, remaining)
             payload = {"yes": yes.raw, "no": no.raw}
             if yes.ask is not None and no.ask is not None:
                 fee = complete_set_taker_fee(yes.ask, no.ask, active_fee_rate)
@@ -2149,6 +2237,17 @@ def watch_url(
             books = book_client.get_books({cfg.token_id for cfg in configs})
             btc_snapshot = fetch_reference_price_snapshot(market.resolution_source) if needs_reference else None
             btc = btc_snapshot.price if btc_snapshot else None
+            for outcome in market.outcomes:
+                write_latest_state(
+                    con,
+                    market.slug,
+                    outcome.name,
+                    outcome.token_id,
+                    books[outcome.token_id],
+                    btc_snapshot,
+                    clock_snapshot,
+                    remaining,
+                )
             for cfg in configs:
                 book = books[cfg.token_id]
                 if snapshots.allow(f"{cfg.label}:{cfg.token_id}", now_ts):
@@ -2631,6 +2730,153 @@ def ensure_dashboard_market_metadata(con: sqlite3.Connection, db_path: Path, run
     return hydrated
 
 
+def dashboard_preset_items(run_metadata: dict[str, Any]) -> list[dict[str, str]]:
+    config = run_metadata.get("config") if isinstance(run_metadata.get("config"), dict) else {}
+    presets = config.get("presets") if isinstance(config, dict) else None
+    if not isinstance(presets, list):
+        presets = DEFAULT_PRESETS
+    items: list[dict[str, str]] = []
+    for preset in presets:
+        if not isinstance(preset, dict) or preset.get("enabled") is False:
+            continue
+        key = str(preset.get("key") or "legacy")
+        items.append({"key": key, "name": str(preset.get("name") or key)})
+    return items or [{"key": "legacy", "name": "Legacy"}]
+
+
+def latest_state_snapshot_rows(
+    con: sqlite3.Connection,
+    current_market_slug: str,
+    run_metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        rows = rows_to_dicts(
+            con.execute(
+                """
+                SELECT ts, market_slug, outcome, token_id, bid, ask, last, bid_size, ask_size,
+                       book_updated_ms, book_source, btc_price, btc_received_ms, btc_source,
+                       clock_ts, clock_source, clock_age_seconds, remaining_seconds
+                FROM latest_state
+                WHERE (? = '' OR market_slug = ?)
+                ORDER BY ts DESC
+                LIMIT 20
+                """,
+                (current_market_slug, current_market_slug),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+    now_ts = utc_now()
+    current_ms = now_ms()
+    preset_items = dashboard_preset_items(run_metadata)
+    snapshots: list[dict[str, Any]] = []
+    for row in rows:
+        market_slug = str(row.get("market_slug") or current_market_slug or "")
+        outcome = str(row.get("outcome") or "")
+        base_label = f"{market_slug} {outcome}".strip() or str(row.get("token_id") or "token")
+        book_updated_ms = parse_optional_float(row.get("book_updated_ms"))
+        book_age_ms = (
+            max(0, current_ms - int(book_updated_ms))
+            if book_updated_ms is not None
+            else max(0, (now_ts - int(row["ts"])) * 1000)
+        )
+        btc_received_ms = parse_optional_float(row.get("btc_received_ms"))
+        btc_age_ms = max(0, current_ms - int(btc_received_ms)) if btc_received_ms is not None else None
+        for preset in preset_items:
+            snapshots.append(
+                {
+                    "ts": row["ts"],
+                    "label": f"{base_label} preset:{preset['key']}",
+                    "preset_key": preset["key"],
+                    "preset_name": preset["name"],
+                    "market_slug": market_slug,
+                    "outcome": outcome,
+                    "token_id": row["token_id"],
+                    "bid": row["bid"],
+                    "ask": row["ask"],
+                    "last": row["last"],
+                    "bid_size": row["bid_size"],
+                    "ask_size": row["ask_size"],
+                    "btc_price": row["btc_price"],
+                    "time": iso(int(row["ts"])) if row.get("ts") else "",
+                    "book_age_ms": book_age_ms,
+                    "freshness": "fresh" if book_age_ms <= DEFAULT_BOOK_STALE_MS else "snapshot",
+                    "source": row.get("book_source") or "latest_state",
+                    "btc_source": row.get("btc_source") or "latest_state",
+                    "btc_age_ms": btc_age_ms,
+                    "remaining_seconds": row.get("remaining_seconds"),
+                    "clock_ts": row.get("clock_ts"),
+                    "clock_source": row.get("clock_source"),
+                    "clock_age_seconds": row.get("clock_age_seconds"),
+                }
+            )
+    return snapshots[:40]
+
+
+def build_market_reference(
+    market_metadata: dict[str, Any],
+    latest_snapshots: list[dict[str, Any]],
+    allow_reference_fallback: bool = True,
+) -> dict[str, Any]:
+    latest_reference_snapshot = next((snap for snap in latest_snapshots if snap.get("btc_price") is not None), None)
+    target_price = market_metadata.get("target_price")
+    current_price = latest_reference_snapshot.get("btc_price") if latest_reference_snapshot else None
+    current_time = latest_reference_snapshot.get("time") if latest_reference_snapshot else None
+    current_price_source = (
+        latest_reference_snapshot.get("btc_source")
+        or latest_reference_snapshot.get("source")
+        if latest_reference_snapshot
+        else None
+    )
+    price_age_ms = (
+        latest_reference_snapshot.get("btc_age_ms")
+        if latest_reference_snapshot and latest_reference_snapshot.get("btc_age_ms") is not None
+        else latest_reference_snapshot.get("book_age_ms") if latest_reference_snapshot else None
+    )
+    if current_price is None and allow_reference_fallback and market_metadata.get("resolution_source"):
+        try:
+            price_snapshot = fetch_reference_price_snapshot(str(market_metadata.get("resolution_source")), timeout=3.0)
+            current_price = price_snapshot.price
+            current_time = iso()
+            current_price_source = price_snapshot.source
+            price_age_ms = price_snapshot.age_ms()
+        except (OSError, TimeoutError, ValueError):
+            current_price = None
+    clock_snapshot = DASHBOARD_CLOCK.snapshot(sync=env_bool("POLYMARKET_DASHBOARD_SYNC_SERVER_TIME", default=False))
+    remaining_from_state = (
+        latest_reference_snapshot.get("remaining_seconds")
+        if latest_reference_snapshot and latest_reference_snapshot.get("remaining_seconds") is not None
+        else None
+    )
+    remaining_seconds = (
+        int(remaining_from_state)
+        if remaining_from_state is not None
+        else max(0, int(market_metadata["end_ts"]) - clock_snapshot.unix_ts) if market_metadata.get("end_ts") is not None else None
+    )
+    time_source = (
+        latest_reference_snapshot.get("clock_source")
+        if latest_reference_snapshot and latest_reference_snapshot.get("clock_source")
+        else clock_snapshot.source
+    )
+    clock_age_seconds = (
+        latest_reference_snapshot.get("clock_age_seconds")
+        if latest_reference_snapshot and latest_reference_snapshot.get("clock_age_seconds") is not None
+        else clock_snapshot.synced_age_seconds
+    )
+    return {
+        "target_price": target_price,
+        "current_price": current_price,
+        "current_price_source": current_price_source,
+        "price_age_ms": price_age_ms,
+        "distance": float(current_price) - float(target_price) if current_price is not None and target_price is not None else None,
+        "remaining_seconds": remaining_seconds,
+        "current_time": current_time,
+        "resolution_source": market_metadata.get("resolution_source"),
+        "time_source": time_source,
+        "clock_age_seconds": clock_age_seconds,
+    }
+
+
 def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
     return {
         "generated_at": iso(),
@@ -2842,64 +3088,41 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     overall["total_with_active_pnl"] = overall["pnl"] + active_unrealized_pnl
 
     current_market_slug = str(market_metadata.get("slug") or "").strip()
-    snapshot_where = "WHERE label LIKE ?" if current_market_slug else ""
-    snapshot_params: tuple[str, ...] = (f"{current_market_slug} %",) if current_market_slug else ()
-    latest_snapshots = rows_to_dicts(
-        con.execute(
-            f"""
-            SELECT s.ts, s.label,
-                   CASE
-                       WHEN instr(s.label, 'preset:') > 0 THEN substr(s.label, instr(s.label, 'preset:') + 7)
-                       ELSE 'legacy'
-                   END AS preset_key,
-                   s.token_id, s.bid, s.ask, s.last, s.bid_size, s.ask_size, s.btc_price
-            FROM snapshots s
-            JOIN (
-                SELECT label, token_id, MAX(ts) AS max_ts
-                FROM snapshots
-                {snapshot_where}
-                GROUP BY label, token_id
-            ) latest
-              ON latest.label = s.label AND latest.token_id = s.token_id AND latest.max_ts = s.ts
-            ORDER BY s.ts DESC
-            LIMIT 40
-            """,
-            snapshot_params,
-        ).fetchall()
-    )
-    for snap in latest_snapshots:
-        snap["time"] = iso(int(snap["ts"])) if snap["ts"] else ""
-        snap["book_age_ms"] = max(0, (utc_now() - int(snap["ts"])) * 1000) if snap["ts"] else None
-        snap["freshness"] = "fresh" if snap["book_age_ms"] is not None and snap["book_age_ms"] <= DEFAULT_BOOK_STALE_MS else "snapshot"
-    add_preset_names(latest_snapshots, preset_names)
-    latest_reference_snapshot = next((snap for snap in latest_snapshots if snap.get("btc_price") is not None), None)
-    target_price = market_metadata.get("target_price")
-    current_price = latest_reference_snapshot.get("btc_price") if latest_reference_snapshot else None
-    current_time = latest_reference_snapshot.get("time") if latest_reference_snapshot else None
-    current_price_source = "snapshot" if latest_reference_snapshot else None
-    price_age_ms = latest_reference_snapshot.get("book_age_ms") if latest_reference_snapshot else None
-    if current_price is None and market_metadata.get("resolution_source"):
-        try:
-            price_snapshot = fetch_reference_price_snapshot(str(market_metadata.get("resolution_source")), timeout=3.0)
-            current_price = price_snapshot.price
-            current_time = iso()
-            current_price_source = price_snapshot.source
-            price_age_ms = price_snapshot.age_ms()
-        except (OSError, TimeoutError, ValueError):
-            current_price = None
-    clock_snapshot = DASHBOARD_CLOCK.snapshot(sync=env_bool("POLYMARKET_DASHBOARD_SYNC_SERVER_TIME", default=False))
-    market_reference = {
-        "target_price": target_price,
-        "current_price": current_price,
-        "current_price_source": current_price_source,
-        "price_age_ms": price_age_ms,
-        "distance": float(current_price) - float(target_price) if current_price is not None and target_price is not None else None,
-        "remaining_seconds": max(0, int(market_metadata["end_ts"]) - clock_snapshot.unix_ts) if market_metadata.get("end_ts") is not None else None,
-        "current_time": current_time,
-        "resolution_source": market_metadata.get("resolution_source"),
-        "time_source": clock_snapshot.source,
-        "clock_age_seconds": clock_snapshot.synced_age_seconds,
-    }
+    latest_snapshots = latest_state_snapshot_rows(con, current_market_slug, run_metadata)
+    if not latest_snapshots:
+        snapshot_where = "WHERE label LIKE ?" if current_market_slug else ""
+        snapshot_params: tuple[str, ...] = (f"{current_market_slug} %",) if current_market_slug else ()
+        latest_snapshots = rows_to_dicts(
+            con.execute(
+                f"""
+                SELECT s.ts, s.label,
+                       CASE
+                           WHEN instr(s.label, 'preset:') > 0 THEN substr(s.label, instr(s.label, 'preset:') + 7)
+                           ELSE 'legacy'
+                       END AS preset_key,
+                       s.token_id, s.bid, s.ask, s.last, s.bid_size, s.ask_size, s.btc_price
+                FROM snapshots s
+                JOIN (
+                    SELECT label, token_id, MAX(ts) AS max_ts
+                    FROM snapshots
+                    {snapshot_where}
+                    GROUP BY label, token_id
+                ) latest
+                  ON latest.label = s.label AND latest.token_id = s.token_id AND latest.max_ts = s.ts
+                ORDER BY s.ts DESC
+                LIMIT 40
+                """,
+                snapshot_params,
+            ).fetchall()
+        )
+        for snap in latest_snapshots:
+            snap["time"] = iso(int(snap["ts"])) if snap["ts"] else ""
+            snap["book_age_ms"] = max(0, (utc_now() - int(snap["ts"])) * 1000) if snap["ts"] else None
+            snap["freshness"] = "fresh" if snap["book_age_ms"] is not None and snap["book_age_ms"] <= DEFAULT_BOOK_STALE_MS else "snapshot"
+            snap["source"] = "snapshot"
+            snap["btc_source"] = "snapshot"
+        add_preset_names(latest_snapshots, preset_names)
+    market_reference = build_market_reference(market_metadata, latest_snapshots, allow_reference_fallback=True)
 
     arb = rows_to_dicts(
         con.execute(
@@ -2955,6 +3178,33 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     }
     con.close()
     return payload
+
+
+def dashboard_realtime_payload(db_path: Path) -> dict[str, Any]:
+    if db_path == empty_dashboard_db_path() and not db_path.exists():
+        empty = empty_dashboard_payload(db_path)
+        return {
+            "generated_at": empty["generated_at"],
+            "db_path": empty["db_path"],
+            "market_reference": empty["market_reference"],
+            "snapshots": [],
+        }
+    con = init_db(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        run_metadata = read_run_metadata(con)
+        market_metadata = ensure_dashboard_market_metadata(con, db_path, run_metadata)
+        current_market_slug = str(market_metadata.get("slug") or "").strip()
+        latest_snapshots = latest_state_snapshot_rows(con, current_market_slug, run_metadata)
+        market_reference = build_market_reference(market_metadata, latest_snapshots, allow_reference_fallback=False)
+        return {
+            "generated_at": iso(),
+            "db_path": str(db_path),
+            "market_reference": market_reference,
+            "snapshots": latest_snapshots,
+        }
+    finally:
+        con.close()
 
 
 BOT_LOCK = threading.Lock()
@@ -3356,6 +3606,21 @@ def current_dashboard_payload() -> dict[str, Any]:
     if not running:
         return empty_dashboard_payload(empty_dashboard_db_path())
     return dashboard_payload(db_path)
+
+
+def current_realtime_payload() -> dict[str, Any]:
+    with BOT_LOCK:
+        running = bot_running_unlocked()
+        db_path = BOT_DB_PATH or DASHBOARD_DB_PATH
+    if not running:
+        empty = empty_dashboard_payload(empty_dashboard_db_path())
+        return {
+            "generated_at": empty["generated_at"],
+            "db_path": empty["db_path"],
+            "market_reference": empty["market_reference"],
+            "snapshots": [],
+        }
+    return dashboard_realtime_payload(db_path)
 
 
 def tail_file(path: Path, max_lines: int = 120) -> list[str]:
@@ -4364,11 +4629,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     function plannedRR(row){const p=presetConfigByKey()[row.preset_key];if(!p)return'<span class="subtle">n/a</span>';const rr=rrMetrics(p);return Number.isFinite(rr.avg)?`${rr.avg.toFixed(2)}R`:'<span class="neg">Invalid</span>'}
     function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">Tat ca preset</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all'}
     function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
+    function renderRealtimeBits(data){renderActiveMarketReference(data);table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data)}
     function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;renderActiveMarketReference(data);table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
     function renderTrades(){if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,rows=state.trades.filter(r=>{const hay=`${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason} ${r.preset_name}`.toLowerCase();if(q&&!hay.includes(q))return false;if(presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true});table('tradesTable',[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Vao',r=>r.entry_time],['Thoat',r=>r.exit_time],['Giu',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],rows,'Khong co lenh phu hop')}
     document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
     async function refresh(){const res=await fetch('/api/dashboard',{cache:'no-store'});render(await res.json())}
-    updatePresetRisk();refresh();refreshBot();setInterval(refresh,2000);setInterval(refreshBot,2000);
+    async function refreshRealtime(){if(!state)return;const res=await fetch('/api/realtime',{cache:'no-store'}),data=await res.json();state.market_reference=data.market_reference||state.market_reference;state.snapshots=data.snapshots||[];document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderRealtimeBits(state)}
+    updatePresetRisk();refresh();refreshBot();setInterval(refresh,2000);setInterval(refreshRealtime,500);setInterval(refreshBot,2000);
   </script>
 </body>
 </html>"""
@@ -4397,6 +4664,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/dashboard":
             self.send_json(current_dashboard_payload())
+            return
+        if parsed.path == "/api/realtime":
+            self.send_json(current_realtime_payload())
             return
         if parsed.path == "/api/bot/status":
             self.send_json(bot_status())

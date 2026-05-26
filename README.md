@@ -142,6 +142,7 @@ python paper_bot.py compact-db --include-runs
 
 New runs store compact top-of-book snapshots by default instead of full raw order books. Snapshot rows are written every 2 seconds per label/token by default, while trade entries, exits, arbitrage events, and errors are still recorded immediately.
 Set `POLYMARKET_SNAPSHOT_INTERVAL_SECONDS=10` to write fewer analysis snapshots, `POLYMARKET_SNAPSHOT_INTERVAL_SECONDS=0` to record every loop, or `POLYMARKET_STORE_RAW_SNAPSHOT_JSON=1` if you intentionally need full raw orderbook JSON.
+The dashboard does not wait for those historical snapshots for live values: the bot also UPSERTs a bounded `latest_state` row per token, and the UI polls `/api/realtime` every 500 ms for current price, countdown, and latest bid/ask.
 
 Realtime safeguards:
 
