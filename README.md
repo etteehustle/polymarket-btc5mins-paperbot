@@ -2,7 +2,7 @@
 
 Read-only realtime paper tester for Polymarket strategies.
 
-This tool does not use a wallet, private key, API key, or real orders. It polls public Polymarket order books and BTC spot price, then simulates trades with local rules.
+This tool does not use a wallet, private key, API key, or real orders. It streams public Polymarket CLOB order books and Polymarket RTDS reference prices, then simulates trades with local rules.
 
 ## What It Tests
 
@@ -31,6 +31,8 @@ This runs:
 
 - band scalping on every outcome, such as `Up` and `Down`
 - complete-set arbitrage scanning on the first two outcomes
+- realtime UP/DOWN bid/ask from Polymarket CLOB WebSocket
+- current BTC price from Polymarket RTDS `crypto_prices_chainlink`
 - automatic stop at the market end time plus 1 second
 - an automatic report for that market after the watcher stops
 
@@ -132,6 +134,26 @@ python paper_bot.py summary `
   --export-csv reports\trades.csv
 ```
 
+Compact old SQLite run files after long paper sessions:
+
+```powershell
+python paper_bot.py compact-db --include-runs
+```
+
+New runs store compact top-of-book snapshots by default instead of full raw order books. Snapshot rows are written every 2 seconds per label/token by default, while trade entries, exits, arbitrage events, and errors are still recorded immediately.
+Set `POLYMARKET_SNAPSHOT_INTERVAL_SECONDS=10` to write fewer analysis snapshots, `POLYMARKET_SNAPSHOT_INTERVAL_SECONDS=0` to record every loop, or `POLYMARKET_STORE_RAW_SNAPSHOT_JSON=1` if you intentionally need full raw orderbook JSON.
+
+Realtime safeguards:
+
+- the CLOB market WebSocket sends `PING` every 10 seconds and reconnects with backoff
+- RTDS sends `PING` every 5 seconds and rejects stale current prices
+- price-to-beat fallback data is not accepted until 5 seconds after the market start; if the target is still missing, the bot retries every 3 seconds up to 5 times and then stops
+- when chaining markets, a target that exactly matches the previous market target is treated as stale and retried instead of being shown as the new price to beat
+- BTC up/down 5m markets use the timestamp in the slug as the trading window, so the old market watcher ends at `slug_ts + 300s` instead of waiting on stale metadata
+- if the CLOB book stream closes after the market end, the bot treats it as normal market completion and moves to the next chained market
+- strategy entries fail closed when UP/DOWN book data, current price, or Polymarket clock sync is stale
+- REST `/book` is only used as a one-time bootstrap if the first WebSocket snapshot is delayed
+
 The summary shows:
 
 - total trades, total paper PnL, average PnL, win rate, and ROI on paper size
@@ -161,5 +183,5 @@ Use the current Polymarket fee docs for other categories, for example `0.03` for
 
 - `watch-directional` assumes taker-style paper fills: enter at best ask, exit at best bid.
 - This is conservative for market-taking and still imperfect during fast moves.
-- It does not know whether a maker order would really fill. For that, collect WebSocket orderbook/trade streams later.
+- Maker fill simulation is still approximate, but the bot now has WebSocket orderbook/trade updates for later analysis.
 - Dashboard runs write separate databases under `data/runs/`; direct CLI commands still default to `data/paper.sqlite` unless `--db` is provided.

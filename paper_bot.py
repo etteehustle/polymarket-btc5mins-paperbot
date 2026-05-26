@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
-import hmac
 import json
 import math
 import os
@@ -37,6 +35,13 @@ DEFAULT_BOT_STDERR = ROOT / "reports" / "ui_bot.err.log"
 USER_AGENT = "SecondBrainPolymarketPaperBot/0.1"
 DEFAULT_TAKER_FEE_RATE = 0.07
 DEFAULT_POLL_SECONDS = 2
+DEFAULT_SNAPSHOT_INTERVAL_SECONDS = DEFAULT_POLL_SECONDS
+DEFAULT_STATUS_LOG_INTERVAL_SECONDS = 15
+DEFAULT_REALTIME_LOOP_SECONDS = 0.5
+DEFAULT_BOOK_STALE_MS = 1500
+DEFAULT_REFERENCE_PRICE_STALE_MS = 2000
+DEFAULT_CLOCK_SYNC_INTERVAL_SECONDS = 10
+DEFAULT_CLOCK_STALE_SECONDS = 30
 DEFAULT_CHAIN_COUNT = 6
 DEFAULT_ENTRY_MIN = 0.65
 DEFAULT_ENTRY_MAX = 0.68
@@ -51,9 +56,12 @@ DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET = 1
 DEFAULT_MARKET_LOCK_AFTER_LOSS = True
 DEFAULT_NO_ENTRY_AFTER_SECONDS = 0
 DEFAULT_MAX_SUM_ASKS = 1.03
-CHAINLINK_DATASTREAMS_BASE_URL = "https://api.dataengine.chain.link"
-CHAINLINK_PRICE_SCALE = 10**18
+DEFAULT_TARGET_PRICE_START_DELAY_SECONDS = 5
+DEFAULT_TARGET_PRICE_RETRY_SECONDS = 3
+DEFAULT_TARGET_PRICE_MAX_RETRIES = 5
+UPDOWN_5M_DURATION_SECONDS = 300
 POLYMARKET_RTDS_URL = "wss://ws-live-data.polymarket.com"
+POLYMARKET_CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 DEFAULT_PRESETS = [
     {
         "key": "safe",
@@ -108,6 +116,31 @@ class BookTop:
     ask_size: float | None
     last: float | None
     raw: dict[str, Any]
+    updated_ms: int | None = None
+    source: str = "rest"
+
+
+@dataclass
+class PriceSnapshot:
+    price: float
+    timestamp_ms: int | None
+    received_ms: int
+    source: str
+
+    def age_ms(self, now_ms_value: int | None = None) -> int:
+        current = now_ms() if now_ms_value is None else now_ms_value
+        return max(0, current - self.received_ms)
+
+
+@dataclass
+class ClockSnapshot:
+    unix_ts: int
+    source: str
+    synced_age_seconds: int | None
+
+    @property
+    def fresh(self) -> bool:
+        return self.source == "polymarket" and self.synced_age_seconds is not None and self.synced_age_seconds <= DEFAULT_CLOCK_STALE_SECONDS
 
 
 @dataclass
@@ -164,6 +197,10 @@ class MarketInfo:
 
 def utc_now() -> int:
     return int(time.time())
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def iso(ts: int | None = None) -> str:
@@ -240,6 +277,163 @@ def parse_optional_float(value: Any) -> float | None:
         return None
 
 
+class OrderBookState:
+    def __init__(self, token_id: str) -> None:
+        self.token_id = str(token_id)
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+        self.bid: float | None = None
+        self.bid_size: float | None = None
+        self.ask: float | None = None
+        self.ask_size: float | None = None
+        self.last: float | None = None
+        self.updated_ms: int | None = None
+        self.source = "empty"
+        self.hash: str | None = None
+
+    def apply_book(self, message: dict[str, Any], received_ms: int | None = None) -> None:
+        self.bids = levels_from_message(message.get("bids"))
+        self.asks = levels_from_message(message.get("asks"))
+        self.hash = str(message.get("hash") or "") or None
+        self.last = parse_optional_float(message.get("last_trade_price")) or self.last
+        self.updated_ms = message_timestamp_ms(message, received_ms)
+        self.source = "polymarket_ws_book"
+        self.recompute_top()
+
+    def apply_rest_bootstrap(self, book: BookTop, received_ms: int | None = None) -> None:
+        self.bid = book.bid
+        self.bid_size = book.bid_size
+        self.ask = book.ask
+        self.ask_size = book.ask_size
+        self.last = book.last
+        self.updated_ms = received_ms or now_ms()
+        self.source = "rest_bootstrap"
+        self.hash = (str(book.raw.get("hash") or "") or None) if isinstance(book.raw, dict) else None
+
+    def apply_price_change(self, change: dict[str, Any], received_ms: int | None = None) -> None:
+        price = parse_optional_float(change.get("price"))
+        size = parse_optional_float(change.get("size"))
+        side = str(change.get("side") or "").upper()
+        if price is None or size is None:
+            return
+        levels = self.bids if side == "BUY" else self.asks if side == "SELL" else None
+        if levels is None:
+            return
+        if size <= 0:
+            levels.pop(price, None)
+        else:
+            levels[price] = size
+        self.hash = str(change.get("hash") or "") or self.hash
+        self.updated_ms = received_ms or now_ms()
+        self.source = "polymarket_ws_price_change"
+        self.recompute_top()
+        self.apply_best_fields(change, received_ms=self.updated_ms)
+
+    def apply_best_bid_ask(self, message: dict[str, Any], received_ms: int | None = None) -> None:
+        self.apply_best_fields(message, received_ms=message_timestamp_ms(message, received_ms))
+        self.source = "polymarket_ws_best_bid_ask"
+
+    def apply_last_trade(self, message: dict[str, Any], received_ms: int | None = None) -> None:
+        last = parse_optional_float(message.get("price"))
+        if last is not None:
+            self.last = last
+            self.updated_ms = message_timestamp_ms(message, received_ms)
+            self.source = "polymarket_ws_last_trade_price"
+
+    def apply_best_fields(self, message: dict[str, Any], received_ms: int | None = None) -> None:
+        best_bid = parse_optional_float(message.get("best_bid"))
+        best_ask = parse_optional_float(message.get("best_ask"))
+        if best_bid is not None:
+            self.bid = best_bid
+            self.bid_size = self.bids.get(best_bid, self.bid_size)
+        if best_ask is not None:
+            self.ask = best_ask
+            self.ask_size = self.asks.get(best_ask, self.ask_size)
+        if best_bid is not None or best_ask is not None:
+            self.updated_ms = received_ms or now_ms()
+
+    def recompute_top(self) -> None:
+        self.bid = max(self.bids) if self.bids else self.bid if self.source == "rest_bootstrap" else None
+        self.ask = min(self.asks) if self.asks else self.ask if self.source == "rest_bootstrap" else None
+        self.bid_size = self.bids.get(self.bid) if self.bid is not None and self.bids else self.bid_size if self.source == "rest_bootstrap" else None
+        self.ask_size = self.asks.get(self.ask) if self.ask is not None and self.asks else self.ask_size if self.source == "rest_bootstrap" else None
+
+    def age_ms(self, now_ms_value: int | None = None) -> int | None:
+        if self.updated_ms is None:
+            return None
+        current = now_ms() if now_ms_value is None else now_ms_value
+        return max(0, current - self.updated_ms)
+
+    def fresh(self, max_age_ms: int = DEFAULT_BOOK_STALE_MS, now_ms_value: int | None = None) -> bool:
+        age = self.age_ms(now_ms_value)
+        return age is not None and age <= max_age_ms
+
+    def to_book_top(self) -> BookTop:
+        return BookTop(
+            bid=self.bid,
+            bid_size=self.bid_size,
+            ask=self.ask,
+            ask_size=self.ask_size,
+            last=self.last,
+            raw={
+                "source": self.source,
+                "hash": self.hash,
+                "updated_ms": self.updated_ms,
+            },
+            updated_ms=self.updated_ms,
+            source=self.source,
+        )
+
+
+def levels_from_message(value: Any) -> dict[float, float]:
+    levels: dict[float, float] = {}
+    if not isinstance(value, list):
+        return levels
+    for level in value:
+        if not isinstance(level, dict):
+            continue
+        price = parse_optional_float(level.get("price"))
+        size = parse_optional_float(level.get("size"))
+        if price is None or size is None or size <= 0:
+            continue
+        levels[price] = size
+    return levels
+
+
+def message_timestamp_ms(message: dict[str, Any], fallback_ms: int | None = None) -> int:
+    timestamp = message.get("timestamp")
+    parsed = parse_optional_float(timestamp)
+    if parsed is not None:
+        return int(parsed)
+    return fallback_ms or now_ms()
+
+
+def rtds_price_snapshot_from_payload(payload: dict[str, Any], expected_symbol: str, received_ms: int | None = None) -> PriceSnapshot | None:
+    if str(payload.get("symbol") or "").lower() != expected_symbol.lower():
+        return None
+    value = parse_optional_float(payload.get("value"))
+    timestamp = payload.get("timestamp")
+    if value is None:
+        data = payload.get("data")
+        if isinstance(data, list):
+            for item in reversed(data):
+                if not isinstance(item, dict):
+                    continue
+                value = parse_optional_float(item.get("value"))
+                timestamp = item.get("timestamp")
+                if value is not None:
+                    break
+    if value is None:
+        return None
+    timestamp_value = parse_optional_float(timestamp)
+    return PriceSnapshot(
+        price=value,
+        timestamp_ms=int(timestamp_value) if timestamp_value is not None else None,
+        received_ms=received_ms or now_ms(),
+        source="polymarket_rtds_chainlink",
+    )
+
+
 def parse_json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -287,11 +481,27 @@ def iso_z(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def target_lookup_window_open(start_ts: int | None, now_ts: int | None = None) -> bool:
+def target_lookup_window_open(
+    start_ts: int | None,
+    now_ts: int | None = None,
+    delay_seconds: int = DEFAULT_TARGET_PRICE_START_DELAY_SECONDS,
+) -> bool:
     if start_ts is None:
         return False
     current_ts = utc_now() if now_ts is None else now_ts
-    return start_ts <= current_ts + 5
+    return current_ts >= start_ts + max(0, delay_seconds)
+
+
+def target_retry_wait_seconds(
+    start_ts: int | None,
+    now_ts: int | None = None,
+    delay_seconds: int = DEFAULT_TARGET_PRICE_START_DELAY_SECONDS,
+) -> int:
+    if start_ts is None:
+        return 0
+    current_ts = utc_now() if now_ts is None else now_ts
+    retry_after_ts = int(start_ts) + max(0, int(delay_seconds))
+    return max(0, retry_after_ts - current_ts)
 
 
 def updown_symbol(slug: str) -> str | None:
@@ -299,6 +509,16 @@ def updown_symbol(slug: str) -> str | None:
     if not match:
         return None
     return match.group(1).upper()
+
+
+def updown_5m_start_ts(slug: str) -> int | None:
+    match = re.match(r"^[a-z0-9]+-updown-5m-(\d+)$", slug)
+    return int(match.group(1)) if match else None
+
+
+def updown_5m_end_ts(slug: str) -> int | None:
+    start_ts = updown_5m_start_ts(slug)
+    return start_ts + UPDOWN_5M_DURATION_SECONDS if start_ts is not None else None
 
 
 def past_results_target_url(slug: str, start_ts: int | None) -> str | None:
@@ -374,7 +594,7 @@ def fetch_event_page_target_price(slug: str, start_ts: int | None) -> float | No
     return target_price_from_event_page_html(page_html, symbol, iso_z(start_ts))
 
 
-def fetch_market_info(url_or_slug: str) -> MarketInfo:
+def fetch_market_info(url_or_slug: str, allow_target_fallback: bool = True) -> MarketInfo:
     slug = parse_slug(url_or_slug)
     quoted = urllib.parse.quote(slug)
     data: Any | None = None
@@ -418,14 +638,16 @@ def fetch_market_info(url_or_slug: str) -> MarketInfo:
     if len(names) != len(token_ids):
         raise ValueError("Outcome count does not match token ID count")
     outcomes = [Outcome(name=name, token_id=token_id) for name, token_id in zip(names, token_ids)]
-    start_ts = parse_ts(market.get("eventStartTime") or event.get("startTime") or market.get("startDate"))
+    slug_start_ts = updown_5m_start_ts(slug)
+    start_ts = slug_start_ts or parse_ts(market.get("eventStartTime") or event.get("startTime") or market.get("startDate"))
+    end_ts = updown_5m_end_ts(slug) or parse_ts(market.get("endDate"))
     target_price = extract_target_price(event, market)
-    if target_price is None and target_lookup_window_open(start_ts):
+    if allow_target_fallback and target_price is None and target_lookup_window_open(start_ts):
         try:
             target_price = fetch_past_results_target_price(slug, start_ts)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError, TypeError):
             target_price = None
-    if target_price is None and target_lookup_window_open(start_ts):
+    if allow_target_fallback and target_price is None and target_lookup_window_open(start_ts):
         try:
             target_price = fetch_event_page_target_price(slug, start_ts)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError, TypeError):
@@ -433,7 +655,7 @@ def fetch_market_info(url_or_slug: str) -> MarketInfo:
     return MarketInfo(
         slug=slug,
         title=title,
-        end_ts=parse_ts(market.get("endDate")),
+        end_ts=end_ts,
         start_ts=start_ts,
         target_price=target_price,
         resolution_source=extract_resolution_source(event, market),
@@ -441,15 +663,41 @@ def fetch_market_info(url_or_slug: str) -> MarketInfo:
     )
 
 
-def fetch_market_info_with_retry(url_or_slug: str, timeout_seconds: int, require_target: bool = False) -> MarketInfo:
+def target_is_same(target_price: float | None, previous_target_price: float | None) -> bool:
+    if target_price is None or previous_target_price is None:
+        return False
+    return abs(float(target_price) - float(previous_target_price)) <= 1e-9
+
+
+def target_unavailable_reason(market: MarketInfo, previous_target_price: float | None = None) -> str | None:
+    if market.target_price is None:
+        return "not available yet"
+    if target_is_same(market.target_price, previous_target_price):
+        return "the same as previous market target"
+    return None
+
+
+def fetch_market_info_with_retry(
+    url_or_slug: str,
+    timeout_seconds: int,
+    require_target: bool = False,
+    previous_target_price: float | None = None,
+    target_start_delay_seconds: int = DEFAULT_TARGET_PRICE_START_DELAY_SECONDS,
+    target_retry_seconds: int = DEFAULT_TARGET_PRICE_RETRY_SECONDS,
+    target_max_retries: int = DEFAULT_TARGET_PRICE_MAX_RETRIES,
+) -> MarketInfo:
     deadline = utc_now() + max(0, timeout_seconds)
     last_error: ValueError | None = None
     while True:
         try:
             market = fetch_market_info(url_or_slug)
-            if require_target and market.target_price is None:
-                raise ValueError("market target price is not available yet from eventMetadata.priceToBeat, /api/past-results, or event page data")
-            return market
+            if not require_target:
+                return market
+            missing_reason = target_unavailable_reason(market, previous_target_price)
+            if missing_reason is None:
+                return market
+            last_error = ValueError(f"market target price is {missing_reason}")
+            break
         except ValueError as exc:
             last_error = exc
             if utc_now() >= deadline:
@@ -457,9 +705,58 @@ def fetch_market_info_with_retry(url_or_slug: str, timeout_seconds: int, require
             wait = min(5, max(1, deadline - utc_now()))
             print(f"[{iso()}] market not available yet, retrying in {wait}s: {exc}")
             time.sleep(wait)
+    wait_for_target = target_retry_wait_seconds(
+        market.start_ts,
+        delay_seconds=target_start_delay_seconds,
+    )
+    if wait_for_target > 0:
+        ready_ts = int(market.start_ts) + max(0, int(target_start_delay_seconds)) if market.start_ts else None
+        ready_text = iso(ready_ts) if ready_ts is not None else "target retry window"
+        print(f"[{iso()}] market target price is {missing_reason}; waiting {wait_for_target}s until {ready_text}")
+        time.sleep(wait_for_target)
+    retries = max(0, int(target_max_retries))
+    attempts = retries + 1
+    retry_wait = max(0, int(target_retry_seconds))
+    for attempt in range(1, attempts + 1):
+        try:
+            market = fetch_market_info(url_or_slug)
+        except ValueError as exc:
+            last_error = exc
+            missing_reason = str(exc)
+        else:
+            missing_reason = target_unavailable_reason(market, previous_target_price)
+            if missing_reason is None:
+                return market
+            last_error = ValueError(f"market target price is {missing_reason}")
+        if attempt < attempts:
+            print(
+                f"[{iso()}] market target price is {missing_reason}; "
+                f"retry {attempt}/{retries} in {retry_wait}s"
+            )
+            if retry_wait:
+                time.sleep(retry_wait)
+    slug = parse_slug(url_or_slug)
+    detail = f" Last error: {last_error}" if last_error else ""
+    raise ValueError(
+        f"No current market target price for '{slug}' after waiting "
+        f"{target_start_delay_seconds}s after market start and {retries} retries.{detail}"
+    )
 
 
-def fetch_book(token_id: str) -> BookTop:
+def pending_market_metadata(url_or_slug: str) -> dict[str, Any]:
+    slug = parse_slug(url_or_slug)
+    return {
+        "slug": slug,
+        "title": slug,
+        "target_price": None,
+        "resolution_source": None,
+        "start_ts": None,
+        "end_ts": None,
+        "status": "lookup",
+    }
+
+
+def fetch_book_rest(token_id: str) -> BookTop:
     qs = urllib.parse.urlencode({"token_id": token_id})
     data = http_json(f"https://clob.polymarket.com/book?{qs}")
     bids = data.get("bids") or []
@@ -476,7 +773,13 @@ def fetch_book(token_id: str) -> BookTop:
         ask_size=ask_size,
         last=float(last_raw) if last_raw not in (None, "") else None,
         raw=data,
+        updated_ms=now_ms(),
+        source="rest",
     )
+
+
+def fetch_book(token_id: str) -> BookTop:
+    return fetch_book_rest(token_id)
 
 
 def env_first(*names: str) -> str | None:
@@ -487,7 +790,36 @@ def env_first(*names: str) -> str | None:
     return None
 
 
-def chainlink_stream_slug(resolution_source: str | None) -> str | None:
+def env_float(name: str, default: float) -> float:
+    raw = env_first(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = env_first(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def snapshot_interval_seconds() -> int:
+    return max(0, int(env_float("POLYMARKET_SNAPSHOT_INTERVAL_SECONDS", DEFAULT_SNAPSHOT_INTERVAL_SECONDS)))
+
+
+def status_log_interval_seconds() -> int:
+    return max(0, int(env_float("POLYMARKET_STATUS_LOG_INTERVAL_SECONDS", DEFAULT_STATUS_LOG_INTERVAL_SECONDS)))
+
+
+def store_raw_snapshot_json() -> bool:
+    return env_bool("POLYMARKET_STORE_RAW_SNAPSHOT_JSON", default=False)
+
+
+def rtds_symbol_from_resolution_source(resolution_source: str | None) -> str | None:
     if not resolution_source:
         return None
     parsed = urllib.parse.urlparse(resolution_source)
@@ -495,106 +827,21 @@ def chainlink_stream_slug(resolution_source: str | None) -> str | None:
     parts = [part for part in parsed.path.split("/") if part]
     if host != "data.chain.link" or len(parts) < 2 or parts[0] != "streams":
         return None
-    return parts[1].lower()
-
-
-def chainlink_auth_headers(method: str, path_with_params: str, api_key: str, user_secret: str, body: bytes = b"") -> dict[str, str]:
-    timestamp = str(int(time.time() * 1000))
-    body_hash = hashlib.sha256(body).hexdigest()
-    string_to_sign = f"{method.upper()} {path_with_params} {body_hash} {api_key} {timestamp}"
-    signature = hmac.new(user_secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-    return {
-        "Authorization": api_key,
-        "X-Authorization-Timestamp": timestamp,
-        "X-Authorization-Signature-SHA256": signature,
-        "User-Agent": USER_AGENT,
+    stream_slug = parts[1].lower()
+    symbol_map = {
+        "btc-usd": "btc/usd",
+        "btc-usd-cexprice-streams": "btc/usd",
+        "eth-usd": "eth/usd",
+        "sol-usd": "sol/usd",
+        "xrp-usd": "xrp/usd",
     }
-
-
-def fetch_chainlink_latest_report(feed_id: str, timeout: int = 20) -> dict[str, Any]:
-    base_url = env_first("CHAINLINK_DATASTREAMS_BASE_URL") or CHAINLINK_DATASTREAMS_BASE_URL
-    api_key = env_first("CHAINLINK_DATASTREAMS_API_KEY", "CHAINLINK_STREAMS_API_KEY", "API_KEY")
-    user_secret = env_first("CHAINLINK_DATASTREAMS_USER_SECRET", "CHAINLINK_STREAMS_API_SECRET", "USER_SECRET")
-    if not api_key or not user_secret:
-        raise ValueError(
-            "Chainlink Data Streams credentials are required for exact Polymarket reference price. "
-            "Set CHAINLINK_DATASTREAMS_API_KEY and CHAINLINK_DATASTREAMS_USER_SECRET."
-        )
-    parsed = urllib.parse.urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("CHAINLINK_DATASTREAMS_BASE_URL must be an http(s) URL")
-    path = "/api/v1/reports/latest"
-    query = urllib.parse.urlencode({"feedID": feed_id})
-    path_with_params = f"{path}?{query}"
-    url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
-    req = urllib.request.Request(url, headers=chainlink_auth_headers("GET", path_with_params, api_key, user_secret))
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _hex_bytes(value: str) -> bytes:
-    raw = value[2:] if value.startswith("0x") else value
-    if len(raw) % 2:
-        raise ValueError("hex value must have an even number of characters")
-    return bytes.fromhex(raw)
-
-
-def _abi_uint(word: bytes) -> int:
-    return int.from_bytes(word, "big", signed=False)
-
-
-def _abi_int(word: bytes) -> int:
-    return int.from_bytes(word, "big", signed=True)
-
-
-def _decode_abi_dynamic_bytes(data: bytes, offset: int) -> bytes:
-    if offset < 0 or offset + 32 > len(data):
-        raise ValueError("invalid Chainlink report blob offset")
-    length = _abi_uint(data[offset : offset + 32])
-    start = offset + 32
-    end = start + length
-    if end > len(data):
-        raise ValueError("invalid Chainlink report blob length")
-    return data[start:end]
-
-
-def decode_chainlink_v3_report_prices(full_report_hex: str, expected_feed_id: str | None = None) -> dict[str, Any]:
-    full_report = _hex_bytes(full_report_hex)
-    min_words = 7
-    if len(full_report) < min_words * 32:
-        raise ValueError("Chainlink fullReport is too short")
-    report_blob_offset = _abi_uint(full_report[3 * 32 : 4 * 32])
-    report_blob = _decode_abi_dynamic_bytes(full_report, report_blob_offset)
-    if len(report_blob) < 9 * 32:
-        raise ValueError("Chainlink v3 reportBlob is too short")
-    feed_id = "0x" + report_blob[0:32].hex()
-    if expected_feed_id and feed_id.lower() != expected_feed_id.lower():
-        raise ValueError(f"Chainlink report feedID mismatch: {feed_id} != {expected_feed_id}")
-    price = _abi_int(report_blob[6 * 32 : 7 * 32]) / CHAINLINK_PRICE_SCALE
-    bid = _abi_int(report_blob[7 * 32 : 8 * 32]) / CHAINLINK_PRICE_SCALE
-    ask = _abi_int(report_blob[8 * 32 : 9 * 32]) / CHAINLINK_PRICE_SCALE
-    return {
-        "feedID": feed_id,
-        "validFromTimestamp": _abi_uint(report_blob[1 * 32 : 2 * 32]),
-        "observationsTimestamp": _abi_uint(report_blob[2 * 32 : 3 * 32]),
-        "price": price,
-        "bid": bid,
-        "ask": ask,
-    }
-
-
-def chainlink_report_price(report_payload: dict[str, Any], expected_feed_id: str) -> float:
-    report = report_payload.get("report") if isinstance(report_payload.get("report"), dict) else report_payload
-    if not isinstance(report, dict) or not isinstance(report.get("fullReport"), str):
-        raise ValueError("Chainlink latest report response did not include fullReport")
-    decoded = decode_chainlink_v3_report_prices(report["fullReport"], expected_feed_id=expected_feed_id)
-    return float(decoded["price"])
+    return symbol_map.get(stream_slug)
 
 
 def websocket_connect(url: str, timeout: float = 10.0) -> socket.socket:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "wss" or not parsed.netloc:
-        raise ValueError("Polymarket RTDS URL must be a wss URL")
+        raise ValueError("Polymarket websocket URL must be a wss URL")
     host = parsed.hostname or ""
     port = parsed.port or 443
     path = parsed.path or "/"
@@ -619,13 +866,13 @@ def websocket_connect(url: str, timeout: float = 10.0) -> socket.socket:
     while b"\r\n\r\n" not in response:
         chunk = sock.recv(4096)
         if not chunk:
-            raise ValueError("Polymarket RTDS websocket closed during handshake")
+            raise ValueError("Polymarket websocket closed during handshake")
         response += chunk
         if len(response) > 16_384:
-            raise ValueError("Polymarket RTDS websocket handshake response is too large")
+            raise ValueError("Polymarket websocket handshake response is too large")
     status = response.split(b"\r\n", 1)[0]
     if b" 101 " not in status:
-        raise ValueError(f"Polymarket RTDS websocket handshake failed: {status.decode('ascii', errors='replace')}")
+        raise ValueError(f"Polymarket websocket handshake failed: {status.decode('ascii', errors='replace')}")
     return sock
 
 
@@ -635,7 +882,7 @@ def websocket_read_exact(sock: socket.socket, length: int) -> bytes:
     while remaining > 0:
         chunk = sock.recv(remaining)
         if not chunk:
-            raise ValueError("Polymarket RTDS websocket closed unexpectedly")
+            raise ValueError("Polymarket websocket closed unexpectedly")
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -660,6 +907,10 @@ def websocket_send_text(sock: socket.socket, payload: dict[str, Any]) -> None:
     websocket_send_frame(sock, 0x1, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
 
+def websocket_send_raw_text(sock: socket.socket, payload: str) -> None:
+    websocket_send_frame(sock, 0x1, payload.encode("utf-8"))
+
+
 def websocket_recv_text(sock: socket.socket) -> str:
     while True:
         first, second = websocket_read_exact(sock, 2)
@@ -677,9 +928,198 @@ def websocket_recv_text(sock: socket.socket) -> str:
         if opcode == 0x1:
             return payload.decode("utf-8")
         if opcode == 0x8:
-            raise ValueError("Polymarket RTDS websocket closed")
+            raise ValueError("Polymarket websocket closed")
         if opcode == 0x9:
             websocket_send_frame(sock, 0xA, payload)
+
+
+class PolymarketMarketWsClient:
+    def __init__(
+        self,
+        asset_ids: list[str],
+        stale_after_ms: int = DEFAULT_BOOK_STALE_MS,
+        bootstrap_timeout: float = 5.0,
+    ) -> None:
+        self.asset_ids = sorted({str(asset_id) for asset_id in asset_ids if str(asset_id).strip()})
+        self.stale_after_ms = stale_after_ms
+        self.bootstrap_timeout = bootstrap_timeout
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.sock: socket.socket | None = None
+        self.books_by_token = {asset_id: OrderBookState(asset_id) for asset_id in self.asset_ids}
+        self.error: str | None = None
+        self.bootstrap_attempted = False
+
+    def start(self) -> None:
+        if not self.asset_ids:
+            raise ValueError("Polymarket market websocket needs at least one asset ID")
+        self.stop_event.clear()
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._run, name="polymarket-market-ws", daemon=True)
+            self.thread.start()
+
+    def stop(self, join_timeout: float = 1.0) -> None:
+        self.stop_event.set()
+        with self.lock:
+            sock = self.sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        thread = self.thread
+        if thread and thread.is_alive():
+            thread.join(timeout=join_timeout)
+
+    def _run(self) -> None:
+        backoff = 0.5
+        while not self.stop_event.is_set():
+            try:
+                self._stream_once()
+                backoff = 0.5
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                with self.lock:
+                    self.error = str(exc)
+                if self.stop_event.wait(backoff):
+                    break
+                backoff = min(5.0, backoff * 2)
+
+    def _stream_once(self) -> None:
+        sock = websocket_connect(POLYMARKET_CLOB_MARKET_WS_URL, timeout=10)
+        sock.settimeout(1.0)
+        with self.lock:
+            self.sock = sock
+        try:
+            websocket_send_text(
+                sock,
+                {
+                    "assets_ids": self.asset_ids,
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                },
+            )
+            next_ping = time.monotonic() + 10.0
+            while not self.stop_event.is_set():
+                if time.monotonic() >= next_ping:
+                    websocket_send_raw_text(sock, "PING")
+                    next_ping = time.monotonic() + 10.0
+                try:
+                    raw_message = websocket_recv_text(sock)
+                except TimeoutError:
+                    continue
+                if raw_message in {"PONG", ""}:
+                    continue
+                self.apply_raw_message(raw_message)
+        finally:
+            with self.lock:
+                if self.sock is sock:
+                    self.sock = None
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def apply_raw_message(self, raw_message: str) -> None:
+        try:
+            message = json.loads(raw_message)
+        except json.JSONDecodeError:
+            return
+        if isinstance(message, list):
+            for item in message:
+                if isinstance(item, dict):
+                    self.apply_message(item, received_ms=now_ms())
+            return
+        if isinstance(message, dict):
+            self.apply_message(message, received_ms=now_ms())
+
+    def apply_message(self, message: dict[str, Any], received_ms: int | None = None) -> None:
+        event_type = str(message.get("event_type") or "")
+        with self.lock:
+            if event_type == "book":
+                asset_id = str(message.get("asset_id") or "")
+                state = self.books_by_token.get(asset_id)
+                if state is not None:
+                    state.apply_book(message, received_ms=received_ms)
+            elif event_type == "price_change":
+                timestamp_ms = message_timestamp_ms(message, received_ms)
+                changes = message.get("price_changes")
+                if isinstance(changes, list):
+                    for change in changes:
+                        if not isinstance(change, dict):
+                            continue
+                        asset_id = str(change.get("asset_id") or "")
+                        state = self.books_by_token.get(asset_id)
+                        if state is not None:
+                            state.apply_price_change(change, received_ms=timestamp_ms)
+            elif event_type == "best_bid_ask":
+                asset_id = str(message.get("asset_id") or "")
+                state = self.books_by_token.get(asset_id)
+                if state is not None:
+                    state.apply_best_bid_ask(message, received_ms=received_ms)
+            elif event_type == "last_trade_price":
+                asset_id = str(message.get("asset_id") or "")
+                state = self.books_by_token.get(asset_id)
+                if state is not None:
+                    state.apply_last_trade(message, received_ms=received_ms)
+            if self._all_have_data_unlocked():
+                self.error = None
+                self.ready.set()
+
+    def _all_have_data_unlocked(self) -> bool:
+        return all(state.updated_ms is not None and (state.bid is not None or state.ask is not None) for state in self.books_by_token.values())
+
+    def bootstrap_missing_from_rest(self) -> None:
+        with self.lock:
+            missing = [asset_id for asset_id, state in self.books_by_token.items() if state.updated_ms is None]
+            if self.bootstrap_attempted or not missing:
+                return
+            self.bootstrap_attempted = True
+        for asset_id in missing:
+            book = fetch_book_rest(asset_id)
+            with self.lock:
+                state = self.books_by_token.get(asset_id)
+                if state is not None and state.updated_ms is None:
+                    state.apply_rest_bootstrap(book, received_ms=now_ms())
+        with self.lock:
+            if self._all_have_data_unlocked():
+                self.ready.set()
+
+    def get_books(self, asset_ids: list[str] | set[str] | tuple[str, ...] | None = None, timeout: float | None = None) -> dict[str, BookTop]:
+        wanted = [str(asset_id) for asset_id in (asset_ids or self.asset_ids)]
+        self.start()
+        wait_timeout = self.bootstrap_timeout if timeout is None else timeout
+        if not self.ready.wait(wait_timeout):
+            self.bootstrap_missing_from_rest()
+        current_ms = now_ms()
+        with self.lock:
+            missing = [
+                asset_id
+                for asset_id in wanted
+                if asset_id not in self.books_by_token
+                or self.books_by_token[asset_id].updated_ms is None
+                or (self.books_by_token[asset_id].bid is None and self.books_by_token[asset_id].ask is None)
+            ]
+            stale = [
+                asset_id
+                for asset_id in wanted
+                if asset_id in self.books_by_token and not self.books_by_token[asset_id].fresh(self.stale_after_ms, now_ms_value=current_ms)
+            ]
+            if missing or stale:
+                details = []
+                if missing:
+                    details.append(f"missing={','.join(missing)}")
+                if stale:
+                    details.append(f"stale={','.join(stale)}")
+                if self.error:
+                    details.append(f"last_error={self.error}")
+                raise ValueError("Polymarket CLOB websocket book unavailable: " + "; ".join(details))
+            return {asset_id: self.books_by_token[asset_id].to_book_top() for asset_id in wanted}
 
 
 class PolymarketRtdsPriceClient:
@@ -690,6 +1130,7 @@ class PolymarketRtdsPriceClient:
         self.thread: threading.Thread | None = None
         self.price: float | None = None
         self.timestamp_ms: int | None = None
+        self.received_ms: int | None = None
         self.error: str | None = None
 
     def start(self) -> None:
@@ -710,6 +1151,7 @@ class PolymarketRtdsPriceClient:
 
     def _stream_once(self) -> None:
         sock = websocket_connect(POLYMARKET_RTDS_URL, timeout=10)
+        sock.settimeout(1.0)
         try:
             websocket_send_text(
                 sock,
@@ -724,8 +1166,17 @@ class PolymarketRtdsPriceClient:
                     ],
                 },
             )
+            next_ping = time.monotonic() + 5.0
             while True:
-                raw_message = websocket_recv_text(sock)
+                if time.monotonic() >= next_ping:
+                    websocket_send_raw_text(sock, "PING")
+                    next_ping = time.monotonic() + 5.0
+                try:
+                    raw_message = websocket_recv_text(sock)
+                except TimeoutError:
+                    continue
+                if raw_message in {"PONG", ""}:
+                    continue
                 try:
                     message = json.loads(raw_message)
                 except json.JSONDecodeError:
@@ -733,15 +1184,13 @@ class PolymarketRtdsPriceClient:
                 payload = message.get("payload") if isinstance(message, dict) else None
                 if not isinstance(payload, dict):
                     continue
-                if str(payload.get("symbol") or "").lower() != self.symbol:
+                snapshot = rtds_price_snapshot_from_payload(payload, self.symbol, received_ms=now_ms())
+                if snapshot is None:
                     continue
-                value = parse_optional_float(payload.get("value"))
-                if value is None:
-                    continue
-                timestamp = payload.get("timestamp")
                 with self.lock:
-                    self.price = value
-                    self.timestamp_ms = int(timestamp) if isinstance(timestamp, (int, float, str)) and str(timestamp).isdigit() else None
+                    self.price = snapshot.price
+                    self.timestamp_ms = snapshot.timestamp_ms
+                    self.received_ms = snapshot.received_ms
                     self.error = None
                     self.ready.set()
         finally:
@@ -750,16 +1199,32 @@ class PolymarketRtdsPriceClient:
             except OSError:
                 pass
 
-    def get(self, timeout: float = 8.0) -> float:
+    def snapshot(self, timeout: float = 8.0, max_age_ms: int = DEFAULT_REFERENCE_PRICE_STALE_MS) -> PriceSnapshot:
         self.start()
-        if not self.ready.wait(timeout):
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self.ready.wait(min(remaining, 0.25)):
+                if time.monotonic() < deadline:
+                    continue
+                with self.lock:
+                    detail = f" Last error: {self.error}" if self.error else ""
+                raise ValueError(f"No Polymarket RTDS {self.symbol} price received within {timeout:.1f}s.{detail}")
             with self.lock:
-                detail = f" Last error: {self.error}" if self.error else ""
-            raise ValueError(f"No Polymarket RTDS {self.symbol} price received within {timeout:.1f}s.{detail}")
-        with self.lock:
-            if self.price is None:
-                raise ValueError(f"No Polymarket RTDS {self.symbol} price is available")
-            return self.price
+                if self.price is not None and self.received_ms is not None:
+                    snapshot = PriceSnapshot(
+                        price=self.price,
+                        timestamp_ms=self.timestamp_ms,
+                        received_ms=self.received_ms,
+                        source="polymarket_rtds_chainlink",
+                    )
+                    if snapshot.age_ms() <= max_age_ms:
+                        return snapshot
+            if time.monotonic() >= deadline:
+                raise ValueError(f"Polymarket RTDS {self.symbol} price is stale")
+
+    def get(self, timeout: float = 8.0) -> float:
+        return self.snapshot(timeout=timeout).price
 
 
 POLYMARKET_RTDS_PRICE_CLIENTS: dict[str, PolymarketRtdsPriceClient] = {}
@@ -767,23 +1232,91 @@ POLYMARKET_RTDS_PRICE_CLIENTS_LOCK = threading.Lock()
 
 
 def fetch_polymarket_rtds_price(symbol: str = "btc/usd", timeout: float = 8.0) -> float:
+    return fetch_polymarket_rtds_snapshot(symbol=symbol, timeout=timeout).price
+
+
+def fetch_polymarket_rtds_snapshot(
+    symbol: str = "btc/usd",
+    timeout: float = 8.0,
+    max_age_ms: int = DEFAULT_REFERENCE_PRICE_STALE_MS,
+) -> PriceSnapshot:
     normalized = symbol.lower()
     with POLYMARKET_RTDS_PRICE_CLIENTS_LOCK:
         client = POLYMARKET_RTDS_PRICE_CLIENTS.get(normalized)
         if client is None:
             client = PolymarketRtdsPriceClient(normalized)
             POLYMARKET_RTDS_PRICE_CLIENTS[normalized] = client
-    return client.get(timeout=timeout)
+    return client.snapshot(timeout=timeout, max_age_ms=max_age_ms)
 
 
 def fetch_reference_price(resolution_source: str | None, timeout: float = 8.0) -> float:
-    stream_slug = chainlink_stream_slug(resolution_source)
-    if stream_slug not in {"btc-usd", "btc-usd-cexprice-streams"}:
+    return fetch_reference_price_snapshot(resolution_source, timeout=timeout).price
+
+
+def fetch_reference_price_snapshot(
+    resolution_source: str | None,
+    timeout: float = 8.0,
+    max_age_ms: int = DEFAULT_REFERENCE_PRICE_STALE_MS,
+) -> PriceSnapshot:
+    symbol = rtds_symbol_from_resolution_source(resolution_source)
+    if symbol is None:
         raise ValueError(
             "Exact reference price requires Polymarket resolutionSource https://data.chain.link/streams/btc-usd. "
             f"Got {resolution_source or 'none'}."
         )
-    return fetch_polymarket_rtds_price("btc/usd", timeout=timeout)
+    return fetch_polymarket_rtds_snapshot(symbol, timeout=timeout, max_age_ms=max_age_ms)
+
+
+class PolymarketClock:
+    def __init__(self, sync_interval_seconds: int = DEFAULT_CLOCK_SYNC_INTERVAL_SECONDS) -> None:
+        self.sync_interval_seconds = max(1, sync_interval_seconds)
+        self.lock = threading.Lock()
+        self.offset_seconds = 0
+        self.last_sync_monotonic: float | None = None
+        self.error: str | None = None
+
+    def sync_if_due(self) -> None:
+        with self.lock:
+            due = self.last_sync_monotonic is None or time.monotonic() - self.last_sync_monotonic >= self.sync_interval_seconds
+        if due:
+            self.sync()
+
+    def sync(self) -> None:
+        try:
+            server_ts = int(http_text("https://clob.polymarket.com/time", timeout=3).strip())
+            local_ts = utc_now()
+            with self.lock:
+                self.offset_seconds = server_ts - local_ts
+                self.last_sync_monotonic = time.monotonic()
+                self.error = None
+        except (OSError, TimeoutError, ValueError) as exc:
+            with self.lock:
+                self.error = str(exc)
+
+    def snapshot(self, sync: bool = True) -> ClockSnapshot:
+        if sync:
+            self.sync_if_due()
+        with self.lock:
+            if self.last_sync_monotonic is None:
+                return ClockSnapshot(unix_ts=utc_now(), source="local_fallback", synced_age_seconds=None)
+            age = int(time.monotonic() - self.last_sync_monotonic)
+            source = "polymarket" if age <= DEFAULT_CLOCK_STALE_SECONDS else "local_fallback"
+            offset = self.offset_seconds if source == "polymarket" else 0
+            return ClockSnapshot(unix_ts=utc_now() + offset, source=source, synced_age_seconds=age)
+
+
+def market_remaining_seconds(end_ts: int, clock: PolymarketClock) -> tuple[int, ClockSnapshot]:
+    snapshot = clock.snapshot()
+    return max(0, end_ts - snapshot.unix_ts), snapshot
+
+
+def is_clob_book_unavailable_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "Polymarket CLOB websocket book unavailable" in message or "Polymarket websocket closed" in message
+
+
+def should_end_market_after_book_error(exc: BaseException, now_ts: int, market_end_ts: int | None) -> bool:
+    return market_end_ts is not None and now_ts >= market_end_ts and is_clob_book_unavailable_error(exc)
 
 
 def fee_rate_from_base_fee(base_fee: Any) -> float:
@@ -863,6 +1396,20 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
     con.execute(
         """
+        CREATE TABLE IF NOT EXISTS market_context (
+            slug TEXT PRIMARY KEY,
+            title TEXT,
+            target_price REAL,
+            resolution_source TEXT,
+            start_ts INTEGER,
+            end_ts INTEGER,
+            status TEXT NOT NULL,
+            updated_ts INTEGER NOT NULL
+        )
+        """
+    )
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS active_positions (
             label TEXT PRIMARY KEY,
             market_slug TEXT,
@@ -908,6 +1455,56 @@ def ensure_column(con: sqlite3.Connection, table: str, column: str, definition: 
         con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+class IntervalGate:
+    def __init__(self, interval_seconds: int) -> None:
+        self.interval_seconds = max(0, interval_seconds)
+        self.last_ts: dict[str, int] = {}
+
+    def allow(self, key: str, now_ts: int | None = None) -> bool:
+        if self.interval_seconds == 0:
+            return True
+        now = utc_now() if now_ts is None else now_ts
+        last = self.last_ts.get(key)
+        if last is None or now - last >= self.interval_seconds:
+            self.last_ts[key] = now
+            return True
+        return False
+
+
+def snapshot_gate() -> IntervalGate:
+    return IntervalGate(snapshot_interval_seconds())
+
+
+def status_log_gate() -> IntervalGate:
+    return IntervalGate(status_log_interval_seconds())
+
+
+def realtime_loop_sleep_seconds(poll_seconds: int | float) -> float:
+    return min(max(0.05, float(poll_seconds)), DEFAULT_REALTIME_LOOP_SECONDS)
+
+
+def snapshot_raw_json(book: BookTop) -> str | None:
+    if not store_raw_snapshot_json():
+        return None
+    return json.dumps(book.raw, separators=(",", ":"))
+
+
+def compact_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict) and ("bids" in value or "asks" in value):
+            compact[key] = {
+                "market": value.get("market"),
+                "asset_id": value.get("asset_id"),
+                "timestamp": value.get("timestamp"),
+                "hash": value.get("hash"),
+                "last_trade_price": value.get("last_trade_price"),
+            }
+        else:
+            compact[key] = value
+    return compact
+
+
 def save_snapshot(
     con: sqlite3.Connection,
     label: str,
@@ -931,7 +1528,7 @@ def save_snapshot(
             book.bid_size,
             book.ask_size,
             btc_price,
-            json.dumps(book.raw, separators=(",", ":")),
+            snapshot_raw_json(book),
         ),
     )
     con.commit()
@@ -1176,7 +1773,7 @@ def record_arb_event(
 ) -> None:
     con.execute(
         "INSERT INTO arb_events (ts, label, market_slug, kind, yes_price, no_price, edge, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (utc_now(), label, market_slug, kind, yes_price, no_price, edge, json.dumps(payload)),
+        (utc_now(), label, market_slug, kind, yes_price, no_price, edge, json.dumps(compact_event_payload(payload), separators=(",", ":"))),
     )
     con.commit()
 
@@ -1236,17 +1833,30 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
     position: PaperPosition | None = None
     end_ts = utc_now() + cfg.seconds
     needs_reference = cfg.target_price is not None
+    snapshots = snapshot_gate()
+    status_logs = status_log_gate()
+    book_client = PolymarketMarketWsClient([cfg.token_id])
+    clock = PolymarketClock()
+    book_client.start()
     if needs_reference:
         fetch_reference_price(cfg.resolution_source)
     print(f"[{iso()}] paper watch started: {cfg.label}")
     print("No wallet. No private key. No real orders.")
     while utc_now() < end_ts:
-        remaining = max(0, end_ts - utc_now())
+        remaining, clock_snapshot = market_remaining_seconds(end_ts, clock)
+        now_ts = clock_snapshot.unix_ts
         try:
-            book = fetch_book(cfg.token_id)
-            btc = fetch_reference_price(cfg.resolution_source) if needs_reference else None
-            save_snapshot(con, cfg.label, cfg.token_id, book, btc)
+            book = book_client.get_books([cfg.token_id])[cfg.token_id]
+            btc_snapshot = fetch_reference_price_snapshot(cfg.resolution_source) if needs_reference else None
+            btc = btc_snapshot.price if btc_snapshot else None
+            if snapshots.allow(f"{cfg.label}:{cfg.token_id}", now_ts):
+                save_snapshot(con, cfg.label, cfg.token_id, book, btc)
             if position is None:
+                if not clock_snapshot.fresh:
+                    if status_logs.allow(f"watch:{cfg.label}", now_ts):
+                        print(f"[{iso()}] watch bid={book.bid} ask={book.ask} reason=clock_stale source={clock_snapshot.source}")
+                    time.sleep(realtime_loop_sleep_seconds(cfg.poll))
+                    continue
                 enter, reason = should_enter(cfg, book, btc, remaining)
                 if enter and book.ask:
                     shares = cfg.size_usd / book.ask
@@ -1257,10 +1867,11 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
                         f"btc={btc if btc is not None else 'n/a'} reason={reason}"
                     )
                 else:
-                    print(
-                        f"[{iso()}] watch bid={book.bid} ask={book.ask} btc={btc if btc is not None else 'n/a'} "
-                        f"remaining={remaining}s reason={reason}"
-                    )
+                    if status_logs.allow(f"watch:{cfg.label}", now_ts):
+                        print(
+                            f"[{iso()}] watch bid={book.bid} ask={book.ask} btc={btc if btc is not None else 'n/a'} "
+                            f"remaining={remaining}s reason={reason}"
+                        )
             else:
                 exit_now, reason = should_exit(cfg, position, book, btc, remaining)
                 if exit_now and book.bid is not None:
@@ -1271,13 +1882,15 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
                 else:
                     upsert_active_position(con, cfg, position, book, btc)
                     unrealized = (position.shares * book.bid - position.size_usd) if book.bid else math.nan
-                    print(
-                        f"[{iso()}] hold bid={book.bid} ask={book.ask} unrealized={unrealized:.4f} "
-                        f"remaining={remaining}s"
-                    )
+                    if status_logs.allow(f"hold:{cfg.label}", now_ts):
+                        print(
+                            f"[{iso()}] hold bid={book.bid} ask={book.ask} unrealized={unrealized:.4f} "
+                            f"remaining={remaining}s"
+                        )
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(cfg.poll)
+        time.sleep(realtime_loop_sleep_seconds(cfg.poll))
+    book_client.stop()
     delete_active_position(con, cfg)
     print(f"[{iso()}] paper watch ended: {cfg.label}")
 
@@ -1295,12 +1908,17 @@ def watch_arb(
     con = init_db(db_path)
     active_fee_rate = resolve_fee_rate([yes_token_id, no_token_id], fee_rate)
     end_ts = utc_now() + seconds
+    status_logs = status_log_gate()
+    book_client = PolymarketMarketWsClient([yes_token_id, no_token_id])
+    book_client.start()
     print(f"[{iso()}] arb watch started: {label}")
     print(f"Fee rate: {active_fee_rate:.6f}; extra buffer: {buffer:.6f}")
     while utc_now() < end_ts:
+        now_ts = utc_now()
         try:
-            yes = fetch_book(yes_token_id)
-            no = fetch_book(no_token_id)
+            books = book_client.get_books([yes_token_id, no_token_id])
+            yes = books[yes_token_id]
+            no = books[no_token_id]
             payload = {"yes": yes.raw, "no": no.raw}
             if yes.ask is not None and no.ask is not None:
                 fee = complete_set_taker_fee(yes.ask, no.ask, active_fee_rate)
@@ -1334,10 +1952,12 @@ def watch_arb(
                         payload | {"fee": fee, "buffer": buffer, "fee_rate": active_fee_rate},
                     )
                     print(f"[{iso()}] ARB sell both bids yes={yes.bid:.3f} no={no.bid:.3f} fee={fee:.5f} edge={edge:.4f}")
-            print(f"[{iso()}] arb watch yes_bid={yes.bid} yes_ask={yes.ask} no_bid={no.bid} no_ask={no.ask}")
+            if status_logs.allow(f"arb:{label}", now_ts):
+                print(f"[{iso()}] arb watch yes_bid={yes.bid} yes_ask={yes.ask} no_bid={no.bid} no_ask={no.ask}")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(poll)
+        time.sleep(realtime_loop_sleep_seconds(poll))
+    book_client.stop()
     print(f"[{iso()}] arb watch ended: {label}")
 
 
@@ -1353,6 +1973,9 @@ def outcome_direction(name: str, index: int) -> str:
 def default_end_ts(market: MarketInfo, requested_seconds: int | None, end_buffer_seconds: int) -> int:
     if requested_seconds is not None:
         return utc_now() + requested_seconds
+    slug_end_ts = updown_5m_end_ts(market.slug)
+    if slug_end_ts is not None:
+        return slug_end_ts + end_buffer_seconds
     if market.end_ts is None:
         return utc_now() + 900
     return market.end_ts + end_buffer_seconds
@@ -1401,14 +2024,29 @@ def watch_url(
         ]
     )
     needs_target = any(float(preset["min_distance_usd"]) > 0 for preset in active_presets)
-    market = fetch_market_info_with_retry(url_or_slug, lookup_timeout_seconds, require_target=needs_target)
+    pending_metadata = pending_market_metadata(url_or_slug)
+    requires_target = needs_target or updown_symbol(pending_metadata["slug"]) is not None
+    previous_target_price = latest_market_target_price(db_path, exclude_slug=pending_metadata["slug"])
+    write_run_metadata(db_path, {"source": url_or_slug})
+    write_market_context(db_path, pending_metadata)
+    try:
+        market = fetch_market_info_with_retry(
+            url_or_slug,
+            lookup_timeout_seconds,
+            require_target=requires_target,
+            previous_target_price=previous_target_price,
+        )
+    except ValueError:
+        failed_metadata = dict(pending_metadata)
+        failed_metadata["status"] = "failed"
+        write_market_context(db_path, failed_metadata)
+        raise
     if len(market.outcomes) < 2:
         raise ValueError("watch-url needs at least two outcomes")
-    if market.target_price is None and needs_target:
+    if market.target_price is None and requires_target:
         raise ValueError(
             "Market target price is unavailable from Polymarket metadata. "
-            "Wait until eventMetadata.priceToBeat or /api/past-results is available, "
-            "or set --min-distance-usd 0 to disable the distance filter."
+            "Wait until eventMetadata.priceToBeat, /api/past-results, or event page data is available."
         )
     needs_reference = market.target_price is not None
     if needs_reference:
@@ -1417,23 +2055,25 @@ def watch_url(
     end_ts = default_end_ts(market, seconds, end_buffer_seconds)
     run_seconds = max(0, end_ts - utc_now())
     con = init_db(db_path)
-    write_run_metadata(
+    write_run_metadata(db_path, {"source": url_or_slug})
+    write_market_context(
         db_path,
         {
-            "market": {
-                "slug": market.slug,
-                "title": market.title,
-                "target_price": market.target_price,
-                "resolution_source": market.resolution_source,
-                "start_ts": market.start_ts,
-                "end_ts": market.end_ts,
-            }
+            "slug": market.slug,
+            "title": market.title,
+            "target_price": market.target_price,
+            "resolution_source": market.resolution_source,
+            "start_ts": market.start_ts,
+            "end_ts": market.end_ts,
+            "status": "active",
         },
     )
     clear_active_positions(con, market.slug)
     positions: dict[str, PaperPosition | None] = {}
     trade_counts: dict[str, int] = {}
     market_locked = False
+    snapshots = snapshot_gate()
+    status_logs = status_log_gate()
     configs: list[DirectionalConfig] = []
     preset_trade_limits = {
         str(preset["key"]): int(preset["max_trades_per_label_per_market"])
@@ -1469,6 +2109,10 @@ def watch_url(
             )
             positions[label] = None
             trade_counts[label] = 0
+    book_client = PolymarketMarketWsClient([outcome.token_id for outcome in market.outcomes])
+    clock = PolymarketClock()
+    book_client.start()
+    clock.sync_if_due()
     print(f"[{iso()}] auto paper watch started: {market.title}")
     print(f"Slug: {market.slug}")
     if market.start_ts:
@@ -1499,16 +2143,22 @@ def watch_url(
     print(f"Fee rate: {active_fee_rate:.6f}; extra arb buffer: {arb_buffer:.6f}")
     print("No wallet. No private key. No real orders.")
     while utc_now() < end_ts:
-        now_ts = utc_now()
-        remaining = max(0, end_ts - now_ts)
+        remaining, clock_snapshot = market_remaining_seconds(end_ts, clock)
+        now_ts = clock_snapshot.unix_ts
         try:
-            books = {token_id: fetch_book(token_id) for token_id in {cfg.token_id for cfg in configs}}
-            btc = fetch_reference_price(market.resolution_source) if needs_reference else None
+            books = book_client.get_books({cfg.token_id for cfg in configs})
+            btc_snapshot = fetch_reference_price_snapshot(market.resolution_source) if needs_reference else None
+            btc = btc_snapshot.price if btc_snapshot else None
             for cfg in configs:
                 book = books[cfg.token_id]
-                save_snapshot(con, cfg.label, cfg.token_id, book, btc)
+                if snapshots.allow(f"{cfg.label}:{cfg.token_id}", now_ts):
+                    save_snapshot(con, cfg.label, cfg.token_id, book, btc)
                 pos = positions[cfg.label]
                 if pos is None:
+                    if not clock_snapshot.fresh:
+                        if status_logs.allow(f"watch:{cfg.label}", now_ts):
+                            print(f"[{iso()}] WATCH {cfg.label} bid={book.bid} ask={book.ask} reason=clock_stale source={clock_snapshot.source}")
+                        continue
                     opposite_book = None
                     if len(market.outcomes) == 2:
                         opposite_cfg = next(
@@ -1529,7 +2179,8 @@ def watch_url(
                         max_sum_asks=max(0.0, max_sum_asks) if len(market.outcomes) == 2 else 0.0,
                     )
                     if not precheck_ok:
-                        print(f"[{iso()}] WATCH {cfg.label} bid={book.bid} ask={book.ask} reason={precheck_reason}")
+                        if status_logs.allow(f"watch:{cfg.label}", now_ts):
+                            print(f"[{iso()}] WATCH {cfg.label} bid={book.bid} ask={book.ask} reason={precheck_reason}")
                         continue
                     enter, reason = should_enter(cfg, book, btc, remaining)
                     reason = f"{precheck_reason};{reason}"
@@ -1539,7 +2190,8 @@ def watch_url(
                         upsert_active_position(con, cfg, positions[cfg.label], book, btc)
                         print(f"[{iso()}] ENTER {cfg.label} ask={book.ask:.3f} shares={shares:.4f} reason={reason}")
                     else:
-                        print(f"[{iso()}] WATCH {cfg.label} bid={book.bid} ask={book.ask} reason={reason}")
+                        if status_logs.allow(f"watch:{cfg.label}", now_ts):
+                            print(f"[{iso()}] WATCH {cfg.label} bid={book.bid} ask={book.ask} reason={reason}")
                 else:
                     exit_now, reason = should_exit(cfg, pos, book, btc, remaining)
                     if exit_now and book.bid is not None:
@@ -1553,7 +2205,8 @@ def watch_url(
                     else:
                         upsert_active_position(con, cfg, pos, book, btc)
                         unrealized = (pos.shares * book.bid - pos.size_usd) if book.bid else math.nan
-                        print(f"[{iso()}] HOLD {cfg.label} bid={book.bid} unrealized={unrealized:.4f}")
+                        if status_logs.allow(f"hold:{cfg.label}", now_ts):
+                            print(f"[{iso()}] HOLD {cfg.label} bid={book.bid} unrealized={unrealized:.4f}")
             first, second = market.outcomes[0], market.outcomes[1]
             a = books[first.token_id]
             b = books[second.token_id]
@@ -1588,10 +2241,15 @@ def watch_url(
                         payload | {"fee": fee, "buffer": arb_buffer, "fee_rate": active_fee_rate},
                     )
                     print(f"[{iso()}] ARB sell both bids {first.name}={a.bid:.3f} {second.name}={b.bid:.3f} fee={fee:.5f} edge={edge:.4f}")
-            print(f"[{iso()}] tick complete remaining={remaining}s")
+            if status_logs.allow(f"tick:{market.slug}", now_ts):
+                print(f"[{iso()}] tick complete remaining={remaining}s")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
+            if should_end_market_after_book_error(exc, now_ts, market.end_ts):
+                print(f"[{iso()}] market ended; Polymarket CLOB book stream closed, moving to next market")
+                break
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(poll)
+        time.sleep(realtime_loop_sleep_seconds(poll))
+    book_client.stop()
     clear_active_positions(con, market.slug)
     print(f"[{iso()}] auto paper watch ended: {market.title}")
     report(db_path, label_like=market.slug)
@@ -1867,10 +2525,73 @@ def read_run_metadata(con: sqlite3.Connection) -> dict[str, Any]:
 
 
 DASHBOARD_MARKET_CACHE: dict[str, tuple[int, dict[str, Any] | None]] = {}
+DASHBOARD_CLOCK = PolymarketClock()
+
+
+def market_context_from_row(row: sqlite3.Row | tuple[Any, ...] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return {
+            "slug": row["slug"],
+            "title": row["title"],
+            "target_price": row["target_price"],
+            "resolution_source": row["resolution_source"],
+            "start_ts": row["start_ts"],
+            "end_ts": row["end_ts"],
+            "status": row["status"],
+        }
+    slug, title, target_price, resolution_source, start_ts, end_ts, status = row[:7]
+    return {
+        "slug": slug,
+        "title": title,
+        "target_price": target_price,
+        "resolution_source": resolution_source,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "status": status,
+    }
+
+
+def active_market_context(con: sqlite3.Connection, run_metadata: dict[str, Any]) -> dict[str, Any] | None:
+    active_slug = run_metadata.get("active_market_slug")
+    if isinstance(active_slug, str) and active_slug.strip():
+        try:
+            row = con.execute(
+                """
+                SELECT slug, title, target_price, resolution_source, start_ts, end_ts, status
+                FROM market_context
+                WHERE slug = ?
+                """,
+                (active_slug.strip(),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        context = market_context_from_row(row)
+        if context is not None:
+            return context
+    try:
+        row = con.execute(
+            """
+            SELECT slug, title, target_price, resolution_source, start_ts, end_ts, status
+            FROM market_context
+            ORDER BY updated_ts DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    context = market_context_from_row(row)
+    if context is not None:
+        return context
+    legacy = run_metadata.get("market")
+    return legacy if isinstance(legacy, dict) else None
 
 
 def ensure_dashboard_market_metadata(con: sqlite3.Connection, db_path: Path, run_metadata: dict[str, Any]) -> dict[str, Any]:
-    market_metadata = run_metadata.get("market") if isinstance(run_metadata.get("market"), dict) else {}
+    market_metadata = active_market_context(con, run_metadata) or {}
+    if market_metadata.get("status") in {"lookup", "failed"}:
+        return market_metadata
     if market_metadata.get("target_price") is not None:
         return market_metadata
     config = run_metadata.get("config") if isinstance(run_metadata.get("config"), dict) else {}
@@ -1894,6 +2615,7 @@ def ensure_dashboard_market_metadata(con: sqlite3.Connection, db_path: Path, run
         "resolution_source": market.resolution_source,
         "start_ts": market.start_ts,
         "end_ts": market.end_ts,
+        "status": "active" if market.target_price is not None else "lookup",
     }
     DASHBOARD_MARKET_CACHE[cache_key] = (now, hydrated)
     run_metadata["market"] = hydrated
@@ -1940,10 +2662,14 @@ def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
         "market_reference": {
             "target_price": None,
             "current_price": None,
+            "current_price_source": None,
+            "price_age_ms": None,
             "distance": None,
             "remaining_seconds": None,
             "current_time": None,
             "resolution_source": None,
+            "time_source": None,
+            "clock_age_seconds": None,
         },
         "snapshots": [],
         "arb": [],
@@ -2115,9 +2841,12 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
     overall["active_size_usd"] = active_size_usd
     overall["total_with_active_pnl"] = overall["pnl"] + active_unrealized_pnl
 
+    current_market_slug = str(market_metadata.get("slug") or "").strip()
+    snapshot_where = "WHERE label LIKE ?" if current_market_slug else ""
+    snapshot_params: tuple[str, ...] = (f"{current_market_slug} %",) if current_market_slug else ()
     latest_snapshots = rows_to_dicts(
         con.execute(
-            """
+            f"""
             SELECT s.ts, s.label,
                    CASE
                        WHEN instr(s.label, 'preset:') > 0 THEN substr(s.label, instr(s.label, 'preset:') + 7)
@@ -2128,34 +2857,48 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
             JOIN (
                 SELECT label, token_id, MAX(ts) AS max_ts
                 FROM snapshots
+                {snapshot_where}
                 GROUP BY label, token_id
             ) latest
               ON latest.label = s.label AND latest.token_id = s.token_id AND latest.max_ts = s.ts
             ORDER BY s.ts DESC
             LIMIT 40
-            """
+            """,
+            snapshot_params,
         ).fetchall()
     )
     for snap in latest_snapshots:
         snap["time"] = iso(int(snap["ts"])) if snap["ts"] else ""
+        snap["book_age_ms"] = max(0, (utc_now() - int(snap["ts"])) * 1000) if snap["ts"] else None
+        snap["freshness"] = "fresh" if snap["book_age_ms"] is not None and snap["book_age_ms"] <= DEFAULT_BOOK_STALE_MS else "snapshot"
     add_preset_names(latest_snapshots, preset_names)
     latest_reference_snapshot = next((snap for snap in latest_snapshots if snap.get("btc_price") is not None), None)
     target_price = market_metadata.get("target_price")
     current_price = latest_reference_snapshot.get("btc_price") if latest_reference_snapshot else None
     current_time = latest_reference_snapshot.get("time") if latest_reference_snapshot else None
+    current_price_source = "snapshot" if latest_reference_snapshot else None
+    price_age_ms = latest_reference_snapshot.get("book_age_ms") if latest_reference_snapshot else None
     if current_price is None and market_metadata.get("resolution_source"):
         try:
-            current_price = fetch_reference_price(str(market_metadata.get("resolution_source")), timeout=3.0)
+            price_snapshot = fetch_reference_price_snapshot(str(market_metadata.get("resolution_source")), timeout=3.0)
+            current_price = price_snapshot.price
             current_time = iso()
+            current_price_source = price_snapshot.source
+            price_age_ms = price_snapshot.age_ms()
         except (OSError, TimeoutError, ValueError):
             current_price = None
+    clock_snapshot = DASHBOARD_CLOCK.snapshot(sync=env_bool("POLYMARKET_DASHBOARD_SYNC_SERVER_TIME", default=False))
     market_reference = {
         "target_price": target_price,
         "current_price": current_price,
+        "current_price_source": current_price_source,
+        "price_age_ms": price_age_ms,
         "distance": float(current_price) - float(target_price) if current_price is not None and target_price is not None else None,
-        "remaining_seconds": max(0, int(market_metadata["end_ts"]) - utc_now()) if market_metadata.get("end_ts") is not None else None,
+        "remaining_seconds": max(0, int(market_metadata["end_ts"]) - clock_snapshot.unix_ts) if market_metadata.get("end_ts") is not None else None,
         "current_time": current_time,
         "resolution_source": market_metadata.get("resolution_source"),
+        "time_source": clock_snapshot.source,
+        "clock_age_seconds": clock_snapshot.synced_age_seconds,
     }
 
     arb = rows_to_dicts(
@@ -2501,7 +3244,7 @@ def latest_run_db_path() -> Path | None:
 def initial_dashboard_db_path(db_path: Path) -> Path:
     if db_path != DEFAULT_DB:
         return db_path
-    return latest_run_db_path() or empty_dashboard_db_path()
+    return empty_dashboard_db_path()
 
 
 def write_run_metadata(db_path: Path, metadata: dict[str, Any]) -> None:
@@ -2520,8 +3263,99 @@ def write_run_metadata(db_path: Path, metadata: dict[str, Any]) -> None:
         con.close()
 
 
+def write_market_context(db_path: Path, metadata: dict[str, Any]) -> None:
+    slug = str(metadata.get("slug") or "").strip()
+    if not slug:
+        raise ValueError("market context requires a slug")
+    con = init_db(db_path)
+    try:
+        con.execute(
+            """
+            INSERT INTO market_context
+            (slug, title, target_price, resolution_source, start_ts, end_ts, status, updated_ts)
+            VALUES (:slug, :title, :target_price, :resolution_source, :start_ts, :end_ts, :status, :updated_ts)
+            ON CONFLICT(slug) DO UPDATE SET
+                title=excluded.title,
+                target_price=excluded.target_price,
+                resolution_source=excluded.resolution_source,
+                start_ts=excluded.start_ts,
+                end_ts=excluded.end_ts,
+                status=excluded.status,
+                updated_ts=excluded.updated_ts
+            """,
+            {
+                "slug": slug,
+                "title": metadata.get("title") or slug,
+                "target_price": metadata.get("target_price"),
+                "resolution_source": metadata.get("resolution_source"),
+                "start_ts": metadata.get("start_ts"),
+                "end_ts": metadata.get("end_ts"),
+                "status": metadata.get("status") or "lookup",
+                "updated_ts": utc_now(),
+            },
+        )
+        con.execute(
+            """
+            INSERT INTO run_metadata (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("active_market_slug", json.dumps(slug, ensure_ascii=False, separators=(",", ":"))),
+        )
+        con.execute(
+            """
+            INSERT INTO run_metadata (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("market", json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def latest_market_target_price(db_path: Path, exclude_slug: str | None = None) -> float | None:
+    if not db_path.exists():
+        return None
+    con = init_db(db_path)
+    try:
+        excluded = (exclude_slug or "").strip()
+        row = con.execute(
+            """
+            SELECT target_price
+            FROM market_context
+            WHERE target_price IS NOT NULL
+              AND (? = '' OR slug != ?)
+            ORDER BY updated_ts DESC
+            LIMIT 1
+            """,
+            (excluded, excluded),
+        ).fetchone()
+        if row is not None:
+            return parse_optional_float(row["target_price"] if isinstance(row, sqlite3.Row) else row[0])
+        metadata = read_run_metadata(con)
+    except sqlite3.OperationalError:
+        metadata = read_run_metadata(con)
+    finally:
+        con.close()
+    legacy = metadata.get("market") if isinstance(metadata.get("market"), dict) else {}
+    if legacy.get("slug") == exclude_slug:
+        return None
+    return parse_optional_float(legacy.get("target_price"))
+
+
 def current_dashboard_db_path() -> Path:
     return DASHBOARD_DB_PATH
+
+
+def current_dashboard_payload() -> dict[str, Any]:
+    with BOT_LOCK:
+        running = bot_running_unlocked()
+        db_path = BOT_DB_PATH or DASHBOARD_DB_PATH
+    if not running:
+        return empty_dashboard_payload(empty_dashboard_db_path())
+    return dashboard_payload(db_path)
 
 
 def tail_file(path: Path, max_lines: int = 120) -> list[str]:
@@ -2737,7 +3571,7 @@ def start_bot(payload: dict[str, Any], db_path: Path) -> dict[str, Any]:
 
 
 def stop_bot() -> dict[str, Any]:
-    global BOT_PROCESS
+    global BOT_PROCESS, BOT_DB_PATH, DASHBOARD_DB_PATH
     with BOT_LOCK:
         process = BOT_PROCESS
         if process is None or process.poll() is not None:
@@ -2762,6 +3596,9 @@ def stop_bot() -> dict[str, Any]:
     with BOT_LOCK:
         if BOT_PROCESS is not None and BOT_PROCESS.poll() is not None:
             BOT_PROCESS = None
+        if not bot_running_unlocked():
+            BOT_DB_PATH = None
+            DASHBOARD_DB_PATH = empty_dashboard_db_path()
     return bot_status()
 
 
@@ -2776,6 +3613,52 @@ def reset_data(db_path: Path) -> dict[str, Any]:
         return bot_status()
     init_db(db_path).close()
     return bot_status()
+
+
+def sqlite_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def compact_db_file(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        raise ValueError(f"SQLite file does not exist: {db_path}")
+    before = db_path.stat().st_size
+    con = sqlite3.connect(db_path)
+    cleared: dict[str, int] = {}
+    try:
+        for table in ("snapshots", "arb_events"):
+            if "raw_json" not in sqlite_columns(con, table):
+                continue
+            count = con.execute(f"SELECT COUNT(*) FROM {table} WHERE raw_json IS NOT NULL AND raw_json != ''").fetchone()[0]
+            if count:
+                con.execute(f"UPDATE {table} SET raw_json = NULL WHERE raw_json IS NOT NULL AND raw_json != ''")
+            cleared[table] = int(count)
+        con.commit()
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    after = db_path.stat().st_size
+    return {
+        "path": str(db_path),
+        "before_bytes": before,
+        "after_bytes": after,
+        "saved_bytes": max(0, before - after),
+        "cleared": cleared,
+    }
+
+
+def compact_db_targets(db_path: Path, include_runs: bool) -> list[Path]:
+    targets = [db_path]
+    if include_runs and DEFAULT_RUNS_DIR.exists():
+        targets.extend(path for path in DEFAULT_RUNS_DIR.glob("*.sqlite") if path.is_file() and not path.name.startswith("_"))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for target in targets:
+        resolved = target.resolve()
+        if resolved not in seen and target.exists():
+            unique.append(target)
+            seen.add(resolved)
+    return unique
 
 
 def bot_status() -> dict[str, Any]:
@@ -3459,7 +4342,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     function activePositionCell(r){return`<div class="stacked"><strong>${presetChip(r)} ${esc(r.market_slug||'n/a')} ${esc(r.outcome||'')}</strong><span class="subtle">Size ${valueMaybe(r.size_usd,2)} | Shares ${valueMaybe(r.shares,4)} | Entry ${valueMaybe(r.entry_price,2)}</span><span class="subtle">Giu ${Number(r.hold_seconds||0)}s</span></div>`}
     function activePriceCell(r){return`<div class="stacked"><strong>${valueMaybe(r.bid,2)}</strong><span class="subtle">Ask ${valueMaybe(r.ask,2)}</span></div>`}
     function activePnlCell(r){if(r.unrealized_pnl===null||r.unrealized_pnl===undefined)return'<span class="subtle">n/a</span>';const roi=r.unrealized_roi===null||r.unrealized_roi===undefined?'n/a':pct(r.unrealized_roi);return`<span class="${cls(r.unrealized_pnl)}"><strong>${Number(r.unrealized_pnl)>=0?'+':''}${fmt(r.unrealized_pnl)}</strong><br>${roi}</span>`}
-    function renderActiveMarketReference(data){const ref=data.market_reference||{},target=valueMaybe(ref.target_price,2),current=valueMaybe(ref.current_price,2),time=ref.current_time?esc(ref.current_time):'no snapshot',distance=ref.distance;let distClass='',distValue='<span class="subtle">n/a</span>';if(distance!==null&&distance!==undefined){const up=Number(distance)>=0;distClass=up?'up':'down';distValue=`${up?'&#9650;':'&#9660;'} ${up?'+':''}${fmt(distance,2)}`}const remaining=ref.remaining_seconds,mins=remaining===null||remaining===undefined?'--':String(Math.floor(Number(remaining)/60)).padStart(2,'0'),secs=remaining===null||remaining===undefined?'--':String(Number(remaining)%60).padStart(2,'0');document.getElementById('activeMarketReference').innerHTML=`<div class="reference-stat reference-target"><span class="reference-label">Price To Beat</span><span class="reference-value">${target}</span></div><div class="reference-stat reference-current"><div class="reference-label-row"><span class="reference-label">Current Price</span><span class="reference-distance-inline ${distClass}">${distValue}</span></div><span class="reference-value">${current}</span><span class="reference-time">${time}</span></div><div class="reference-stat reference-countdown"><span class="reference-value countdown-pair"><span><strong>${mins}</strong><small>mins</small></span><span><strong>${secs}</strong><small>secs</small></span></span></div>`}
+    function renderActiveMarketReference(data){const ref=data.market_reference||{},target=valueMaybe(ref.target_price,2),current=valueMaybe(ref.current_price,2),time=ref.current_time?esc(ref.current_time):'no snapshot',age=ref.price_age_ms===null||ref.price_age_ms===undefined?'':` | ${Math.round(Number(ref.price_age_ms))}ms`,source=ref.current_price_source?` | ${esc(ref.current_price_source)}`:'',clock=ref.time_source?` | time ${esc(ref.time_source)}`:'',distance=ref.distance;let distClass='',distValue='<span class="subtle">n/a</span>';if(distance!==null&&distance!==undefined){const up=Number(distance)>=0;distClass=up?'up':'down';distValue=`${up?'&#9650;':'&#9660;'} ${up?'+':''}${fmt(distance,2)}`}const remaining=ref.remaining_seconds,mins=remaining===null||remaining===undefined?'--':String(Math.floor(Number(remaining)/60)).padStart(2,'0'),secs=remaining===null||remaining===undefined?'--':String(Number(remaining)%60).padStart(2,'0');document.getElementById('activeMarketReference').innerHTML=`<div class="reference-stat reference-target"><span class="reference-label">Price To Beat</span><span class="reference-value">${target}</span></div><div class="reference-stat reference-current"><div class="reference-label-row"><span class="reference-label">Current Price</span><span class="reference-distance-inline ${distClass}">${distValue}</span></div><span class="reference-value">${current}</span><span class="reference-time">${time}${source}${age}${clock}</span></div><div class="reference-stat reference-countdown"><span class="reference-value countdown-pair"><span><strong>${mins}</strong><small>mins</small></span><span><strong>${secs}</strong><small>secs</small></span></span></div>`}
     function setTab(name){document.querySelectorAll('main > section').forEach(el=>el.classList.toggle('hidden',el.id!==name));document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active',el.dataset.tab===name))}
     document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>setTab(btn.dataset.tab)));
     function normalizeTrailingInput(event){const input=event.target;if(!input.matches('[data-preset-field="trail_start"],[data-preset-field="trail_distance"]'))return;const row=input.closest('.preset-row'),start=row.querySelector('[data-preset-field="trail_start"]'),distance=row.querySelector('[data-preset-field="trail_distance"]');if(Number(input.value)<=0){start.value='0';distance.value='0'}}
@@ -3481,7 +4364,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     function plannedRR(row){const p=presetConfigByKey()[row.preset_key];if(!p)return'<span class="subtle">n/a</span>';const rr=rrMetrics(p);return Number.isFinite(rr.avg)?`${rr.avg.toFixed(2)}R`:'<span class="neg">Invalid</span>'}
     function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">Tat ca preset</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all'}
     function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
-    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;renderActiveMarketReference(data);table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
+    function render(data){state=data;document.getElementById('generated').textContent=`Cap nhat ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'Chua co lenh da dong');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} lenh`;renderActiveMarketReference(data);table('activeOverview',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell]],activeRows,'Khong co lenh dang mo');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Cat lo</span> ${data.health.stop_loss_count}</p><p><span class="pill">Lo lon nhat</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Ty trong top 3 PnL</span> ${pct(data.health.top_3_share)}</p><p class="subtle">Neu loi nhuan tap trung vao vai lenh, tiep tuc chay paper truoc khi tang size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Lenh',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Entry TB',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('activePositions',[['Vi the',activePositionCell],['Gia',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'Khong co lenh dang mo');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">Chua co su kien arb.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Loai',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
     function renderTrades(){if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,rows=state.trades.filter(r=>{const hay=`${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason} ${r.preset_name}`.toLowerCase();if(q&&!hay.includes(q))return false;if(presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true});table('tradesTable',[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Vao',r=>r.entry_time],['Thoat',r=>r.exit_time],['Giu',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],rows,'Khong co lenh phu hop')}
     document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
     async function refresh(){const res=await fetch('/api/dashboard',{cache:'no-store'});render(await res.json())}
@@ -3513,7 +4396,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_text(DASHBOARD_HTML, "text/html; charset=utf-8")
             return
         if parsed.path == "/api/dashboard":
-            self.send_json(dashboard_payload(current_dashboard_db_path()))
+            self.send_json(current_dashboard_payload())
             return
         if parsed.path == "/api/bot/status":
             self.send_json(bot_status())
@@ -3674,6 +4557,8 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--port", type=int, default=8765)
     dashboard_parser.add_argument("--host", default="127.0.0.1")
     dashboard_parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
+    compact_parser = sub.add_parser("compact-db", help="Strip bulky raw JSON logs from SQLite files and VACUUM them")
+    compact_parser.add_argument("--include-runs", action="store_true", help="Also compact every SQLite run under data/runs")
     return parser
 
 
@@ -3724,6 +4609,17 @@ def main(argv: list[str] | None = None) -> int:
             summary(args.db, limit=args.limit, export_csv=args.export_csv)
         elif args.cmd == "dashboard":
             serve_dashboard(args.db, host=args.host, port=args.port, open_browser=not args.no_open)
+        elif args.cmd == "compact-db":
+            targets = compact_db_targets(args.db, include_runs=args.include_runs)
+            if not targets:
+                raise ValueError("No SQLite files found to compact")
+            for result in [compact_db_file(path) for path in targets]:
+                saved_mb = result["saved_bytes"] / (1024 * 1024)
+                after_mb = result["after_bytes"] / (1024 * 1024)
+                print(
+                    f"Compacted {result['path']}: saved={saved_mb:.2f} MB "
+                    f"after={after_mb:.2f} MB cleared={result['cleared']}"
+                )
         elif args.cmd == "watch-url":
             if args.chain_count > 1:
                 watch_chain(

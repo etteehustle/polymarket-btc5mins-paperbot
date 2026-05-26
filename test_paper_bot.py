@@ -1,7 +1,10 @@
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import paper_bot
 from paper_bot import (
@@ -12,25 +15,31 @@ from paper_bot import (
     DEFAULT_POLL_SECONDS,
     DirectionalConfig,
     auto_entry_precheck,
-    chainlink_auth_headers,
-    chainlink_stream_slug,
+    ClockSnapshot,
+    current_dashboard_payload,
     dashboard_payload,
-    decode_chainlink_v3_report_prices,
     empty_dashboard_db_path,
     extract_resolution_source,
     extract_target_price,
     fetch_reference_price,
+    IntervalGate,
     initial_dashboard_db_path,
     init_db,
     latest_run_db_path,
     new_run_db_path,
     PaperPosition,
     past_results_target_url,
+    pending_market_metadata,
     fee_rate_from_base_fee,
+    PolymarketClock,
     normalize_bot_config,
     normalize_presets,
+    OrderBookState,
+    PolymarketMarketWsClient,
     parse_json_list,
     parse_slug,
+    rtds_symbol_from_resolution_source,
+    rtds_price_snapshot_from_payload,
     should_enter,
     should_exit,
     target_lookup_window_open,
@@ -39,47 +48,10 @@ from paper_bot import (
     taker_fee_usdc,
     strategy_label,
     slug_with_offset,
+    write_market_context,
     upsert_active_position,
     url_or_slug_with_offset,
 )
-
-
-def abi_word(value, signed=False):
-    return int(value).to_bytes(32, "big", signed=signed)
-
-
-def padded_bytes(value):
-    padding = (32 - (len(value) % 32)) % 32
-    return value + (b"\x00" * padding)
-
-
-def sample_chainlink_full_report(feed_id, price, bid, ask):
-    feed = bytes.fromhex(feed_id.removeprefix("0x"))
-    scale = 10**18
-    report_blob = b"".join(
-        [
-            feed,
-            abi_word(100),
-            abi_word(101),
-            abi_word(0),
-            abi_word(0),
-            abi_word(200),
-            abi_word(int(price * scale), signed=True),
-            abi_word(int(bid * scale), signed=True),
-            abi_word(int(ask * scale), signed=True),
-        ]
-    )
-    head_words = [
-        b"\x00" * 32,
-        b"\x00" * 32,
-        b"\x00" * 32,
-        abi_word(7 * 32),
-        abi_word(0),
-        abi_word(0),
-        b"\x00" * 32,
-    ]
-    encoded_blob = abi_word(len(report_blob)) + padded_bytes(report_blob)
-    return "0x" + (b"".join(head_words) + encoded_blob).hex()
 
 
 def cfg(**overrides):
@@ -127,34 +99,60 @@ class StrategyTests(unittest.TestCase):
         event = {"eventMetadata": '{"resolutionSource":"https://data.chain.link/streams/btc-usd"}'}
         self.assertEqual(extract_resolution_source(event, {}), "https://data.chain.link/streams/btc-usd")
 
-    def test_chainlink_stream_slug_requires_data_chainlink_stream_url(self):
-        self.assertEqual(chainlink_stream_slug("https://data.chain.link/streams/btc-usd"), "btc-usd")
-        self.assertIsNone(chainlink_stream_slug("https://example.com/streams/btc-usd"))
-
-    def test_chainlink_auth_headers_match_documented_hmac_shape(self):
-        with patch("paper_bot.time.time", return_value=1716211845.123):
-            headers = chainlink_auth_headers("GET", "/api/v1/reports/latest?feedID=0xabc", "api-key", "secret")
-        self.assertEqual(headers["Authorization"], "api-key")
-        self.assertEqual(headers["X-Authorization-Timestamp"], "1716211845123")
-        self.assertIn("X-Authorization-Signature-SHA256", headers)
-
-    def test_decode_chainlink_v3_report_price(self):
-        feed_id = "0x" + "01" * 32
-        full_report = sample_chainlink_full_report(feed_id, price=77001.52, bid=77001.50, ask=77001.54)
-        decoded = decode_chainlink_v3_report_prices(full_report, expected_feed_id=feed_id)
-        self.assertAlmostEqual(decoded["price"], 77001.52)
-        self.assertAlmostEqual(decoded["bid"], 77001.50)
-        self.assertAlmostEqual(decoded["ask"], 77001.54)
+    def test_resolution_source_maps_to_polymarket_rtds_symbol(self):
+        self.assertEqual(rtds_symbol_from_resolution_source("https://data.chain.link/streams/btc-usd"), "btc/usd")
+        self.assertEqual(rtds_symbol_from_resolution_source("https://data.chain.link/streams/eth-usd"), "eth/usd")
+        self.assertIsNone(rtds_symbol_from_resolution_source("https://example.com/streams/btc-usd"))
 
     def test_reference_price_uses_polymarket_rtds_chainlink_stream(self):
-        with patch("paper_bot.fetch_polymarket_rtds_price", return_value=77123.45) as fetch_price:
+        with patch("paper_bot.fetch_polymarket_rtds_snapshot", return_value=paper_bot.PriceSnapshot(77123.45, 1, 1, "test")) as fetch_price:
             price = fetch_reference_price("https://data.chain.link/streams/btc-usd", timeout=3.0)
         self.assertAlmostEqual(price, 77123.45)
-        fetch_price.assert_called_once_with("btc/usd", timeout=3.0)
+        fetch_price.assert_called_once_with("btc/usd", timeout=3.0, max_age_ms=paper_bot.DEFAULT_REFERENCE_PRICE_STALE_MS)
+
+    def test_rtds_price_snapshot_uses_subscription_backfill(self):
+        snapshot = rtds_price_snapshot_from_payload(
+            {
+                "symbol": "btc/usd",
+                "data": [
+                    {"timestamp": 1_779_804_100_000, "value": 77138.7},
+                    {"timestamp": 1_779_804_101_000, "value": 77146.5},
+                ],
+            },
+            "btc/usd",
+            received_ms=1_779_804_102_000,
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertAlmostEqual(snapshot.price, 77146.5)
+        self.assertEqual(snapshot.timestamp_ms, 1_779_804_101_000)
+        self.assertEqual(snapshot.received_ms, 1_779_804_102_000)
+
+    def test_rtds_client_snapshot_waits_until_timeout_deadline(self):
+        client = paper_bot.PolymarketRtdsPriceClient("btc/usd")
+        client.start = lambda: None
+
+        def publish() -> None:
+            time.sleep(0.1)
+            with client.lock:
+                client.price = 77123.0
+                client.timestamp_ms = 1_779_804_101_000
+                client.received_ms = paper_bot.now_ms()
+                client.ready.set()
+
+        thread = threading.Thread(target=publish)
+        thread.start()
+        try:
+            snapshot = client.snapshot(timeout=1.0, max_age_ms=5_000)
+        finally:
+            thread.join(timeout=1.0)
+
+        self.assertAlmostEqual(snapshot.price, 77123.0)
 
     def test_runtime_source_no_longer_uses_binance(self):
         source = Path(paper_bot.__file__).read_text(encoding="utf-8")
         self.assertNotIn("api.binance.com", source)
+        self.assertNotIn("api.dataengine.chain.link", source)
 
     def test_slug_with_offset(self):
         self.assertEqual(slug_with_offset("btc-updown-5m-1779550500", 300, 2), "btc-updown-5m-1779551100")
@@ -164,6 +162,47 @@ class StrategyTests(unittest.TestCase):
             url_or_slug_with_offset("https://polymarket.com/event/btc-updown-5m-1779550500", 300, 1),
             "https://polymarket.com/event/btc-updown-5m-1779550800",
         )
+
+    def test_updown_5m_slug_defines_trading_end(self):
+        self.assertEqual(paper_bot.updown_5m_start_ts("btc-updown-5m-1779550500"), 1779550500)
+        self.assertEqual(paper_bot.updown_5m_end_ts("btc-updown-5m-1779550500"), 1779550800)
+
+    def test_default_end_ts_prefers_updown_5m_slug_end(self):
+        market = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=5_000,
+            start_ts=1_000,
+            target_price=77000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+
+        self.assertEqual(paper_bot.default_end_ts(market, requested_seconds=None, end_buffer_seconds=1), 1_301)
+
+    def test_clob_book_error_after_market_end_stops_watch_cleanly(self):
+        exc = ValueError("Polymarket CLOB websocket book unavailable: stale=up,down; last_error=Polymarket websocket closed unexpectedly")
+
+        self.assertTrue(paper_bot.should_end_market_after_book_error(exc, now_ts=1_300, market_end_ts=1_300))
+        self.assertFalse(paper_bot.should_end_market_after_book_error(exc, now_ts=1_299, market_end_ts=1_300))
+
+    def test_market_ws_client_stop_closes_active_socket(self):
+        class FakeSock:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = PolymarketMarketWsClient(["token"])
+        sock = FakeSock()
+        with client.lock:
+            client.sock = sock
+
+        client.stop()
+
+        self.assertTrue(client.stop_event.is_set())
+        self.assertTrue(sock.closed)
 
     def test_enter_when_ask_in_band_and_target_far(self):
         ok, reason = should_enter(cfg(), book(ask=0.70), btc_price=115.0, remaining_seconds=120)
@@ -315,6 +354,215 @@ class StrategyTests(unittest.TestCase):
     def test_fee_rate_from_base_fee_bps(self):
         self.assertEqual(fee_rate_from_base_fee(700), 0.07)
 
+    def test_order_book_state_applies_book_and_price_changes(self):
+        state = OrderBookState("token-up")
+        state.apply_book(
+            {
+                "asset_id": "token-up",
+                "bids": [{"price": "0.48", "size": "30"}, {"price": "0.49", "size": "20"}],
+                "asks": [{"price": "0.52", "size": "25"}, {"price": "0.53", "size": "60"}],
+                "timestamp": "1000",
+                "hash": "0xbook",
+            },
+            received_ms=1001,
+        )
+
+        self.assertEqual(state.to_book_top().bid, 0.49)
+        self.assertEqual(state.to_book_top().bid_size, 20)
+        self.assertEqual(state.to_book_top().ask, 0.52)
+        self.assertEqual(state.to_book_top().ask_size, 25)
+        self.assertTrue(state.fresh(max_age_ms=500, now_ms_value=1200))
+
+        state.apply_price_change({"price": "0.49", "size": "0", "side": "BUY", "hash": "0xremove"}, received_ms=1300)
+        self.assertEqual(state.to_book_top().bid, 0.48)
+        self.assertEqual(state.to_book_top().bid_size, 30)
+        self.assertEqual(state.hash, "0xremove")
+
+    def test_order_book_state_uses_best_bid_ask_when_available(self):
+        state = OrderBookState("token-down")
+        state.apply_best_bid_ask(
+            {
+                "asset_id": "token-down",
+                "best_bid": "0.31",
+                "best_ask": "0.34",
+                "timestamp": "2000",
+            }
+        )
+
+        book_top = state.to_book_top()
+        self.assertEqual(book_top.bid, 0.31)
+        self.assertEqual(book_top.ask, 0.34)
+        self.assertEqual(book_top.source, "polymarket_ws_best_bid_ask")
+
+    def test_market_ws_client_applies_documented_messages(self):
+        client = PolymarketMarketWsClient(["up", "down"], stale_after_ms=1000)
+        client.start = lambda: None
+
+        client.apply_message(
+            {
+                "event_type": "book",
+                "asset_id": "up",
+                "bids": [{"price": "0.63", "size": "10"}],
+                "asks": [{"price": "0.66", "size": "12"}],
+                "timestamp": "1000",
+            },
+            received_ms=1000,
+        )
+        client.apply_message(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "down",
+                "best_bid": "0.32",
+                "best_ask": "0.35",
+                "timestamp": "1000",
+            },
+            received_ms=1000,
+        )
+        client.apply_message(
+            {
+                "event_type": "price_change",
+                "timestamp": "1200",
+                "price_changes": [{"asset_id": "up", "price": "0.67", "size": "4", "side": "SELL"}],
+            },
+            received_ms=1200,
+        )
+
+        with patch("paper_bot.now_ms", return_value=1200):
+            books = client.get_books(["up", "down"], timeout=0)
+        self.assertEqual(books["up"].ask, 0.66)
+        self.assertEqual(books["up"].ask_size, 12)
+        self.assertEqual(books["down"].bid, 0.32)
+        self.assertEqual(books["down"].ask, 0.35)
+
+    def test_market_ws_client_fails_closed_on_stale_books(self):
+        client = PolymarketMarketWsClient(["up"], stale_after_ms=100)
+        client.start = lambda: None
+        client.apply_message(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "up",
+                "best_bid": "0.60",
+                "best_ask": "0.63",
+                "timestamp": "1",
+            },
+            received_ms=1,
+        )
+
+        with patch("paper_bot.now_ms", return_value=500):
+            with self.assertRaises(ValueError):
+                client.get_books(["up"], timeout=0)
+
+    def test_interval_gate_throttles_repeated_keys(self):
+        gate = IntervalGate(interval_seconds=10)
+
+        self.assertTrue(gate.allow("btc-up", now_ts=100))
+        self.assertFalse(gate.allow("btc-up", now_ts=109))
+        self.assertTrue(gate.allow("btc-up", now_ts=110))
+        self.assertTrue(gate.allow("btc-down", now_ts=101))
+
+    def test_polymarket_clock_falls_back_to_local_time_without_sync(self):
+        clock = PolymarketClock()
+        with patch("paper_bot.utc_now", return_value=1234):
+            snapshot = clock.snapshot(sync=False)
+
+        self.assertEqual(snapshot, ClockSnapshot(unix_ts=1234, source="local_fallback", synced_age_seconds=None))
+        self.assertFalse(snapshot.fresh)
+
+    def test_save_snapshot_omits_raw_orderbook_json_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                raw = {
+                    "bids": [{"price": "0.60", "size": "100"} for _ in range(200)],
+                    "asks": [{"price": "0.62", "size": "100"} for _ in range(200)],
+                    "hash": "0xabc",
+                }
+                with patch.dict(paper_bot.os.environ, {"POLYMARKET_STORE_RAW_SNAPSHOT_JSON": "0"}):
+                    paper_bot.save_snapshot(
+                        con,
+                        "test-market Up preset:safe",
+                        "token",
+                        BookTop(bid=0.60, bid_size=100, ask=0.62, ask_size=100, last=0.61, raw=raw),
+                        btc_price=77123.45,
+                    )
+                row = con.execute("SELECT bid, ask, bid_size, ask_size, btc_price, raw_json FROM snapshots").fetchone()
+            finally:
+                con.close()
+
+        self.assertEqual(row[0], 0.60)
+        self.assertEqual(row[1], 0.62)
+        self.assertEqual(row[2], 100)
+        self.assertEqual(row[3], 100)
+        self.assertEqual(row[4], 77123.45)
+        self.assertIsNone(row[5])
+
+    def test_record_arb_event_compacts_raw_orderbook_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                raw_book = {
+                    "market": "0xmarket",
+                    "asset_id": "token",
+                    "timestamp": "123",
+                    "hash": "0xhash",
+                    "bids": [{"price": "0.60", "size": "100"} for _ in range(200)],
+                    "asks": [{"price": "0.62", "size": "100"} for _ in range(200)],
+                }
+                paper_bot.record_arb_event(
+                    con,
+                    label="test-market complete_set",
+                    market_slug="test-market",
+                    kind="buy_complete_set",
+                    yes_price=0.40,
+                    no_price=0.55,
+                    edge=0.01,
+                    payload={"yes": raw_book, "no": raw_book, "fee": 0.02, "buffer": 0.01, "fee_rate": 0.07},
+                )
+                raw_json = con.execute("SELECT raw_json FROM arb_events").fetchone()[0]
+            finally:
+                con.close()
+
+        self.assertIn('"fee":0.02', raw_json)
+        self.assertIn('"hash":"0xhash"', raw_json)
+        self.assertNotIn('"bids"', raw_json)
+        self.assertNotIn('"asks"', raw_json)
+
+    def test_compact_db_file_strips_existing_raw_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                con.execute(
+                    """
+                    INSERT INTO snapshots
+                    (ts, label, token_id, bid, ask, last, bid_size, ask_size, btc_price, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (1, "label", "token", 0.50, 0.51, 0.50, 10, 11, 77000.0, '{"bids":[1],"asks":[2]}'),
+                )
+                con.execute(
+                    "INSERT INTO arb_events (ts, label, market_slug, kind, yes_price, no_price, edge, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (1, "label", "market", "buy_complete_set", 0.40, 0.55, 0.01, '{"bids":[1],"asks":[2]}'),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            result = paper_bot.compact_db_file(db_path)
+            con = sqlite3.connect(db_path)
+            try:
+                snapshot_raw = con.execute("SELECT raw_json FROM snapshots").fetchone()[0]
+                arb_raw = con.execute("SELECT raw_json FROM arb_events").fetchone()[0]
+            finally:
+                con.close()
+
+        self.assertIsNone(snapshot_raw)
+        self.assertIsNone(arb_raw)
+        self.assertEqual(result["cleared"]["snapshots"], 1)
+        self.assertEqual(result["cleared"]["arb_events"], 1)
+
     def test_extract_target_price_from_event_metadata_price_to_beat(self):
         target = extract_target_price({"eventMetadata": {"priceToBeat": 76868.67001633714}}, {})
         self.assertEqual(target, 76868.67001633714)
@@ -371,8 +619,144 @@ class StrategyTests(unittest.TestCase):
 
     def test_target_lookup_window_waits_for_future_market(self):
         self.assertFalse(target_lookup_window_open(start_ts=1_000, now_ts=990))
-        self.assertTrue(target_lookup_window_open(start_ts=1_000, now_ts=995))
-        self.assertTrue(target_lookup_window_open(start_ts=1_000, now_ts=1_001))
+        self.assertFalse(target_lookup_window_open(start_ts=1_000, now_ts=1_001))
+        self.assertTrue(target_lookup_window_open(start_ts=1_000, now_ts=1_005))
+
+    def test_target_retry_wait_seconds_waits_until_start_plus_delay(self):
+        self.assertEqual(paper_bot.target_retry_wait_seconds(start_ts=1_000, now_ts=999), 6)
+        self.assertEqual(paper_bot.target_retry_wait_seconds(start_ts=1_000, now_ts=1_005), 0)
+
+    def test_fetch_market_info_with_retry_waits_then_retries_required_target(self):
+        no_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=None,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        with_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=77000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        with patch("paper_bot.fetch_market_info", side_effect=[no_target, no_target, with_target]) as fetch_info:
+            with patch("paper_bot.target_retry_wait_seconds", return_value=5):
+                with patch("paper_bot.time.sleep") as sleep:
+                    market = paper_bot.fetch_market_info_with_retry(
+                        "btc-updown-5m-1000",
+                        timeout_seconds=60,
+                        require_target=True,
+                        target_retry_seconds=3,
+                        target_max_retries=5,
+                    )
+
+        self.assertEqual(market.target_price, 77000.0)
+        self.assertEqual(fetch_info.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(5), call(3)])
+
+    def test_fetch_market_info_with_retry_rejects_previous_market_target(self):
+        stale_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=76000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        current_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=77000.0,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        with patch("paper_bot.fetch_market_info", side_effect=[stale_target, stale_target, current_target]):
+            with patch("paper_bot.target_retry_wait_seconds", return_value=0):
+                with patch("paper_bot.time.sleep") as sleep:
+                    market = paper_bot.fetch_market_info_with_retry(
+                        "btc-updown-5m-1000",
+                        timeout_seconds=60,
+                        require_target=True,
+                        previous_target_price=76000.0,
+                        target_retry_seconds=3,
+                        target_max_retries=5,
+                    )
+
+        self.assertEqual(market.target_price, 77000.0)
+        self.assertEqual(sleep.call_args_list, [call(3)])
+
+    def test_fetch_market_info_with_retry_stops_after_target_attempts(self):
+        no_target = paper_bot.MarketInfo(
+            slug="btc-updown-5m-1000",
+            title="BTC Up or Down",
+            end_ts=1_300,
+            start_ts=1_000,
+            target_price=None,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+            outcomes=[paper_bot.Outcome("Up", "up"), paper_bot.Outcome("Down", "down")],
+        )
+        with patch("paper_bot.fetch_market_info", side_effect=[no_target, no_target, no_target, no_target]):
+            with patch("paper_bot.target_retry_wait_seconds", return_value=0):
+                with patch("paper_bot.time.sleep") as sleep:
+                    with self.assertRaisesRegex(ValueError, "No current market target price"):
+                        paper_bot.fetch_market_info_with_retry(
+                            "btc-updown-5m-1000",
+                            timeout_seconds=60,
+                            require_target=True,
+                            target_retry_seconds=3,
+                            target_max_retries=2,
+                        )
+
+        self.assertEqual(sleep.call_args_list, [call(3), call(3)])
+
+    def test_pending_market_metadata_clears_previous_target_during_chain_transition(self):
+        metadata = pending_market_metadata("https://polymarket.com/event/btc-updown-5m-1779550800")
+
+        self.assertEqual(metadata["slug"], "btc-updown-5m-1779550800")
+        self.assertIsNone(metadata["target_price"])
+        self.assertIsNone(metadata["resolution_source"])
+        self.assertEqual(metadata["status"], "lookup")
+
+    def test_latest_market_target_price_excludes_current_pending_slug(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-old",
+                    "title": "old",
+                    "target_price": 76000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": 1_300,
+                    "status": "active",
+                },
+            )
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-new",
+                    "title": "new",
+                    "target_price": None,
+                    "resolution_source": None,
+                    "start_ts": 1_300,
+                    "end_ts": 1_600,
+                    "status": "lookup",
+                },
+            )
+
+            target = paper_bot.latest_market_target_price(db_path, exclude_slug="btc-updown-5m-new")
+
+        self.assertEqual(target, 76000.0)
 
     def test_dashboard_chain_count_uses_submitted_value(self):
         config = normalize_bot_config({"url": "btc-updown-5m-1", "chain_count": "3"})
@@ -487,7 +871,7 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("multi_safe-balanced-aggressive_e0.65-0.68", path.name)
         self.assertEqual(path.suffix, ".sqlite")
 
-    def test_initial_dashboard_db_path_prefers_latest_run_over_legacy_default(self):
+    def test_initial_dashboard_db_path_starts_empty_even_when_runs_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_runs_dir = paper_bot.DEFAULT_RUNS_DIR
             paper_bot.DEFAULT_RUNS_DIR = Path(tmp)
@@ -499,7 +883,7 @@ class StrategyTests(unittest.TestCase):
                 ignored.write_text("ignored", encoding="utf-8")
                 newer.write_text("new", encoding="utf-8")
                 self.assertEqual(latest_run_db_path(), newer)
-                self.assertEqual(initial_dashboard_db_path(paper_bot.DEFAULT_DB), newer)
+                self.assertEqual(initial_dashboard_db_path(paper_bot.DEFAULT_DB), empty_dashboard_db_path())
             finally:
                 paper_bot.DEFAULT_RUNS_DIR = old_runs_dir
 
@@ -526,6 +910,37 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(payload["overall"]["trades"], 0)
         self.assertEqual(payload["overall"]["pnl"], 0.0)
         self.assertEqual(payload["trades"], [])
+
+    def test_current_dashboard_payload_is_empty_when_bot_not_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_bot_process = paper_bot.BOT_PROCESS
+            old_bot_db_path = paper_bot.BOT_DB_PATH
+            old_dashboard_db_path = paper_bot.DASHBOARD_DB_PATH
+            db_path = Path(tmp) / "old-run.sqlite"
+            paper_bot.write_run_metadata(
+                db_path,
+                {
+                    "market": {
+                        "target_price": 77000.0,
+                        "resolution_source": "https://data.chain.link/streams/btc-usd",
+                        "end_ts": paper_bot.utc_now() + 120,
+                    }
+                },
+            )
+            try:
+                paper_bot.BOT_PROCESS = None
+                paper_bot.BOT_DB_PATH = db_path
+                paper_bot.DASHBOARD_DB_PATH = db_path
+                payload = current_dashboard_payload()
+            finally:
+                paper_bot.BOT_PROCESS = old_bot_process
+                paper_bot.BOT_DB_PATH = old_bot_db_path
+                paper_bot.DASHBOARD_DB_PATH = old_dashboard_db_path
+
+        self.assertEqual(payload["db_path"], str(empty_dashboard_db_path()))
+        self.assertIsNone(payload["market_reference"]["target_price"])
+        self.assertIsNone(payload["market_reference"]["current_price"])
+        self.assertEqual(payload["snapshots"], [])
 
     def test_dashboard_html_shows_current_data_file(self):
         self.assertIn("dataFile", DASHBOARD_HTML)
@@ -563,6 +978,8 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("reference-distance-inline", DASHBOARD_HTML)
         self.assertIn("Price To Beat", DASHBOARD_HTML)
         self.assertIn("Current Price", DASHBOARD_HTML)
+        self.assertIn("price_age_ms", DASHBOARD_HTML)
+        self.assertIn("time_source", DASHBOARD_HTML)
         self.assertIn("countdown-pair", DASHBOARD_HTML)
         self.assertIn("#f7931a", DASHBOARD_HTML)
         self.assertIn("activePositions", DASHBOARD_HTML)
@@ -630,6 +1047,9 @@ class StrategyTests(unittest.TestCase):
         self.assertGreaterEqual(payload["market_reference"]["remaining_seconds"], 0)
         self.assertLessEqual(payload["market_reference"]["remaining_seconds"], 120)
         self.assertEqual(payload["market_reference"]["resolution_source"], "https://data.chain.link/streams/btc-usd")
+        self.assertEqual(payload["market_reference"]["current_price_source"], "snapshot")
+        self.assertIn("price_age_ms", payload["market_reference"])
+        self.assertEqual(payload["market_reference"]["time_source"], "local_fallback")
 
     def test_dashboard_payload_falls_back_to_polymarket_rtds_current_price(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -644,11 +1064,141 @@ class StrategyTests(unittest.TestCase):
                     }
                 },
             )
-            with patch("paper_bot.fetch_reference_price", return_value=77111.0) as fetch_price:
+            snapshot = paper_bot.PriceSnapshot(price=77111.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="polymarket_rtds_chainlink")
+            with patch("paper_bot.fetch_reference_price_snapshot", return_value=snapshot) as fetch_price:
                 payload = dashboard_payload(db_path)
         fetch_price.assert_called_once_with("https://data.chain.link/streams/btc-usd", timeout=3.0)
         self.assertAlmostEqual(payload["market_reference"]["current_price"], 77111.0)
         self.assertAlmostEqual(payload["market_reference"]["distance"], 111.0)
+        self.assertEqual(payload["market_reference"]["current_price_source"], "polymarket_rtds_chainlink")
+
+    def test_dashboard_payload_ignores_previous_market_snapshots_for_current_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                paper_bot.write_run_metadata(
+                    db_path,
+                    {
+                        "source": "btc-updown-5m-new",
+                        "market": {
+                            "slug": "btc-updown-5m-new",
+                            "title": "btc-updown-5m-new",
+                            "target_price": None,
+                            "resolution_source": None,
+                            "start_ts": None,
+                            "end_ts": paper_bot.utc_now() + 120,
+                            "status": "lookup",
+                        },
+                    },
+                )
+                paper_bot.save_snapshot(con, "btc-updown-5m-old Up preset:safe", "old-token", book(bid=0.60, ask=0.62), btc_price=77123.45)
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertIsNone(payload["market_reference"]["target_price"])
+        self.assertIsNone(payload["market_reference"]["current_price"])
+        self.assertEqual(payload["snapshots"], [])
+
+    def test_dashboard_does_not_hydrate_failed_market_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            paper_bot.write_run_metadata(db_path, {"source": "btc-updown-5m-new"})
+            write_market_context(
+                db_path,
+                {
+                    "slug": "btc-updown-5m-new",
+                    "title": "new",
+                    "target_price": None,
+                    "resolution_source": None,
+                    "start_ts": 1_300,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "failed",
+                },
+            )
+            with patch("paper_bot.fetch_market_info") as fetch_info:
+                payload = dashboard_payload(db_path)
+
+        fetch_info.assert_not_called()
+        self.assertIsNone(payload["market_reference"]["target_price"])
+        self.assertIsNone(payload["market_reference"]["current_price"])
+
+    def test_dashboard_payload_uses_only_current_market_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                paper_bot.write_run_metadata(
+                    db_path,
+                    {
+                        "source": "btc-updown-5m-new",
+                        "market": {
+                            "slug": "btc-updown-5m-new",
+                            "title": "btc-updown-5m-new",
+                            "target_price": 77000.0,
+                            "resolution_source": "https://data.chain.link/streams/btc-usd",
+                            "start_ts": None,
+                            "end_ts": paper_bot.utc_now() + 120,
+                            "status": "active",
+                        },
+                    },
+                )
+                paper_bot.save_snapshot(con, "btc-updown-5m-old Up preset:safe", "old-token", book(bid=0.60, ask=0.62), btc_price=77123.45)
+                paper_bot.save_snapshot(con, "btc-updown-5m-new Up preset:safe", "new-token", book(bid=0.70, ask=0.72), btc_price=77222.0)
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertAlmostEqual(payload["market_reference"]["target_price"], 77000.0)
+        self.assertAlmostEqual(payload["market_reference"]["current_price"], 77222.0)
+        self.assertEqual(len(payload["snapshots"]), 1)
+        self.assertIn("btc-updown-5m-new", payload["snapshots"][0]["label"])
+
+    def test_dashboard_uses_active_market_context_not_legacy_market_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                paper_bot.write_run_metadata(
+                    db_path,
+                    {
+                        "market": {
+                            "slug": "btc-updown-5m-old",
+                            "title": "old",
+                            "target_price": 76000.0,
+                            "resolution_source": "https://data.chain.link/streams/btc-usd",
+                            "start_ts": None,
+                            "end_ts": paper_bot.utc_now() + 120,
+                            "status": "active",
+                        }
+                    },
+                )
+                write_market_context(
+                    db_path,
+                    {
+                        "slug": "btc-updown-5m-new",
+                        "title": "new",
+                        "target_price": 77000.0,
+                        "resolution_source": "https://data.chain.link/streams/btc-usd",
+                        "start_ts": None,
+                        "end_ts": paper_bot.utc_now() + 120,
+                        "status": "active",
+                    },
+                )
+                paper_bot.save_snapshot(con, "btc-updown-5m-old Up preset:safe", "old-token", book(bid=0.60, ask=0.62), btc_price=76111.0)
+                paper_bot.save_snapshot(con, "btc-updown-5m-new Up preset:safe", "new-token", book(bid=0.70, ask=0.72), btc_price=77222.0)
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertEqual(payload["market_reference"]["target_price"], 77000.0)
+        self.assertEqual(payload["market_reference"]["current_price"], 77222.0)
+        self.assertEqual(len(payload["snapshots"]), 1)
+        self.assertIn("btc-updown-5m-new", payload["snapshots"][0]["label"])
 
     def test_dashboard_payload_groups_trades_by_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
