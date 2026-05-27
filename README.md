@@ -7,9 +7,9 @@ This tool does not use a wallet, private key, API key, or real orders. It stream
 ## What It Tests
 
 - Directional BTC up/down scalping:
-  - enter when the ask is around `0.65-0.68` by default
+  - enter when the ask is around `0.62-0.70` in the default Safe preset
   - for BTC 5-minute `watch-url`, auto-read the market target from Polymarket `eventMetadata.priceToBeat`
-  - risk guards default to one trade per label, market lock after a loss, no entries after 180 seconds, and `ask + opposite ask <= 1.03`
+  - risk guards default to one trade per label, market lock after a loss, no entries when 15 seconds or less remain, and `ask + opposite ask <= 1.06`
   - exit on take profit, trailing stop, stop loss, or late ambiguous BTC/target state
 - Complete-set arbitrage scanner:
   - logs when `YES ask + NO ask + taker fees + buffer < 1`
@@ -23,8 +23,7 @@ Paste a Polymarket event URL and let the tool find the outcome token IDs automat
 
 ```powershell
 python paper_bot.py watch-url `
-  "https://polymarket.com/event/btc-updown-5m-1779549600" `
-  --poll 2
+  "https://polymarket.com/event/btc-updown-5m-1779549600"
 ```
 
 This runs:
@@ -50,9 +49,9 @@ If all sources are unavailable, the bot waits during lookup and then fails close
 The optimized dashboard presets are:
 
 ```powershell
-Safe:       entry 0.65-0.68, TP 0.84, SL 0.60, trail 0.05/0.04, BTC dist 100
-Balanced:   entry 0.65-0.70, TP 0.86, SL 0.58, trail 0.05/0.05, BTC dist 75
-Aggressive: entry 0.65-0.72, TP 0.88, SL 0.56, trail 0.08/0.06, BTC dist 75
+Safe:       entry 0.62-0.70, TP 0.88, SL 0.54, trail 0.07/0.05, late 50s, BTC dist 25
+Balanced:   entry 0.66-0.74, TP 0.90, SL 0.58, trail 0.08/0.06, late 50s, BTC dist 25
+Aggressive: entry 0.74-0.82, TP 0.96, SL 0.68, trail 0.10/0.07, late 40s, BTC dist 20
 ```
 
 Set `trail_start` and `trail_distance` to `0` to disable trailing. If either value is `0`, the bot normalizes both to `0` because a one-sided trailing config cannot arm a valid trailing stop.
@@ -61,16 +60,16 @@ Set `take_profit` to `0` to disable the fixed TP exit and let trailing, stop los
 Risk guard defaults:
 
 ```powershell
---max-trades-per-label-per-market 1 --market-lock-after-loss --no-entry-after-seconds 0 --max-sum-asks 1.03 --entry-window-seconds 120
+--max-trades-per-label-per-market 1 --market-lock-after-loss --no-entry-after-seconds 15 --max-sum-asks 1.06 --entry-window-seconds 260
 ```
 
 Optionally limit entries to the final part of a market:
 
 ```powershell
---entry-window-seconds 120
+--entry-window-seconds 260
 ```
 
-Use `--entry-window-seconds 0` to disable the remaining-time gate. The default is 120 seconds, and `--no-entry-after-seconds` defaults to 0 so the late-window filter can operate without an elapsed-time cutoff conflict.
+Use `--entry-window-seconds 0` to disable the "only enter once <= N seconds are left" gate. Use `--no-entry-after-seconds 0` to disable the final-seconds cutoff. For example, `--no-entry-after-seconds 15` means do not open a new position when 15 seconds or less remain.
 
 You can override the runtime if needed:
 
@@ -83,8 +82,7 @@ Run several BTC 5-minute markets in a row:
 ```powershell
 python paper_bot.py watch-url `
   "https://polymarket.com/event/btc-updown-5m-1779550500" `
-  --chain-count 3 `
-  --poll 2
+  --chain-count 3
 ```
 
 For timestamped BTC 5-minute slugs, the tool adds `300` seconds to the slug for each next market. It waits for each market to end plus 1 second, prints that market's report, moves to the next one, and prints an aggregate summary after the chain finishes.
@@ -97,8 +95,7 @@ python paper_bot.py watch-directional `
   --label "BTC 5m UP" `
   --target-price 75000 `
   --direction UP `
-  --seconds 900 `
-  --poll 2
+  --seconds 900
 ```
 
 Generate a report:
@@ -171,8 +168,7 @@ python paper_bot.py watch-arb `
   --no-token-id NO_TOKEN_ID `
   --label "BTC 5m complete set" `
   --fee-rate 0.07 `
-  --seconds 900 `
-  --poll 2
+  --seconds 900
 ```
 
 The bot queries Polymarket's CLOB `/fee-rate` endpoint for the active token and uses `--fee-rate` only as a fallback.

@@ -34,8 +34,7 @@ DEFAULT_BOT_STDOUT = ROOT / "reports" / "ui_bot.log"
 DEFAULT_BOT_STDERR = ROOT / "reports" / "ui_bot.err.log"
 USER_AGENT = "SecondBrainPolymarketPaperBot/0.1"
 DEFAULT_TAKER_FEE_RATE = 0.07
-DEFAULT_POLL_SECONDS = 2
-DEFAULT_SNAPSHOT_INTERVAL_SECONDS = DEFAULT_POLL_SECONDS
+DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 2
 DEFAULT_STATUS_LOG_INTERVAL_SECONDS = 15
 DEFAULT_REALTIME_LOOP_SECONDS = 0.5
 DEFAULT_BOOK_STALE_MS = 1500
@@ -43,20 +42,25 @@ DEFAULT_BOOK_REST_REFRESH_MS = 1000
 DEFAULT_REFERENCE_PRICE_STALE_MS = 2000
 DEFAULT_CLOCK_SYNC_INTERVAL_SECONDS = 10
 DEFAULT_CLOCK_STALE_SECONDS = 30
-DEFAULT_CHAIN_COUNT = 6
-DEFAULT_ENTRY_MIN = 0.65
-DEFAULT_ENTRY_MAX = 0.68
+DEFAULT_DASHBOARD_URL_OR_SLUG = "https://polymarket.com/event/btc-updown-5m-1779609900"
+DEFAULT_CHAIN_COUNT = 30
+DEFAULT_ENTRY_MIN = 0.62
+DEFAULT_ENTRY_MAX = 0.70
 DEFAULT_TAKE_PROFIT = 0.88
-DEFAULT_STOP_LOSS = 0.58
-DEFAULT_LATE_SECONDS = 30
-DEFAULT_TRAIL_START = 0.0
-DEFAULT_TRAIL_DISTANCE = 0.0
-DEFAULT_MIN_DISTANCE_USD = 100.0
-DEFAULT_ENTRY_WINDOW_SECONDS = 120
+DEFAULT_STOP_LOSS = 0.54
+DEFAULT_LATE_SECONDS = 50
+DEFAULT_TRAIL_START = 0.07
+DEFAULT_TRAIL_DISTANCE = 0.05
+DEFAULT_MIN_DISTANCE_USD = 25.0
+DEFAULT_ENTRY_WINDOW_SECONDS = 260
 DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET = 1
 DEFAULT_MARKET_LOCK_AFTER_LOSS = True
-DEFAULT_NO_ENTRY_AFTER_SECONDS = 0
-DEFAULT_MAX_SUM_ASKS = 1.03
+LOSS_LOCK_SCOPES = ("none", "preset", "market")
+DEFAULT_LOSS_LOCK_SCOPE = "market"
+DEFAULT_DASHBOARD_LOSS_LOCK_SCOPE = "preset"
+DEFAULT_NO_ENTRY_AFTER_SECONDS = 15
+DEFAULT_MAX_SUM_ASKS = 1.06
+DEFAULT_ARB_BUFFER = 0.02
 DEFAULT_TARGET_PRICE_START_DELAY_SECONDS = 5
 DEFAULT_TARGET_PRICE_RETRY_SECONDS = 3
 DEFAULT_TARGET_PRICE_MAX_RETRIES = 20
@@ -68,42 +72,42 @@ DEFAULT_PRESETS = [
         "key": "safe",
         "name": "Safe",
         "enabled": True,
-        "entry_min": 0.65,
-        "entry_max": 0.68,
-        "take_profit": 0.84,
-        "stop_loss": 0.60,
-        "trail_start": 0.05,
-        "trail_distance": 0.04,
+        "entry_min": 0.62,
+        "entry_max": 0.70,
+        "take_profit": 0.88,
+        "stop_loss": 0.54,
+        "trail_start": DEFAULT_TRAIL_START,
+        "trail_distance": DEFAULT_TRAIL_DISTANCE,
         "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": 100.0,
+        "min_distance_usd": DEFAULT_MIN_DISTANCE_USD,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
     {
         "key": "balanced",
         "name": "Balanced",
         "enabled": True,
-        "entry_min": 0.65,
-        "entry_max": 0.70,
-        "take_profit": 0.86,
+        "entry_min": 0.66,
+        "entry_max": 0.74,
+        "take_profit": 0.90,
         "stop_loss": 0.58,
-        "trail_start": 0.05,
-        "trail_distance": 0.05,
-        "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": 75.0,
+        "trail_start": 0.08,
+        "trail_distance": 0.06,
+        "late_seconds": 50,
+        "min_distance_usd": 25.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
     {
         "key": "aggressive",
         "name": "Aggressive",
         "enabled": True,
-        "entry_min": 0.65,
-        "entry_max": 0.72,
-        "take_profit": 0.88,
-        "stop_loss": 0.56,
-        "trail_start": 0.08,
-        "trail_distance": 0.06,
-        "late_seconds": DEFAULT_LATE_SECONDS,
-        "min_distance_usd": 75.0,
+        "entry_min": 0.74,
+        "entry_max": 0.82,
+        "take_profit": 0.96,
+        "stop_loss": 0.68,
+        "trail_start": 0.10,
+        "trail_distance": 0.07,
+        "late_seconds": 40,
+        "min_distance_usd": 20.0,
         "max_trades_per_label_per_market": DEFAULT_MAX_TRADES_PER_LABEL_PER_MARKET,
     },
 ]
@@ -170,7 +174,6 @@ class DirectionalConfig:
     late_seconds: int
     entry_window_seconds: int | None
     min_distance_usd: float
-    poll: int
     seconds: int
     resolution_source: str | None = None
 
@@ -183,6 +186,8 @@ class PaperPosition:
     size_usd: float
     reason: str
     peak_bid: float | None = None
+    fee_rate: float = 0.0
+    entry_fee: float = 0.0
 
 
 @dataclass
@@ -1456,6 +1461,11 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
     ensure_column(con, "paper_trades", "market_slug", "TEXT")
     ensure_column(con, "paper_trades", "outcome", "TEXT")
+    ensure_column(con, "paper_trades", "fee_rate", "REAL")
+    ensure_column(con, "paper_trades", "entry_fee", "REAL")
+    ensure_column(con, "paper_trades", "exit_fee", "REAL")
+    ensure_column(con, "paper_trades", "total_fee", "REAL")
+    ensure_column(con, "paper_trades", "gross_pnl", "REAL")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS run_metadata (
@@ -1499,6 +1509,11 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    ensure_column(con, "active_positions", "fee_rate", "REAL")
+    ensure_column(con, "active_positions", "entry_fee", "REAL")
+    ensure_column(con, "active_positions", "exit_fee_estimate", "REAL")
+    ensure_column(con, "active_positions", "total_fee_estimate", "REAL")
+    ensure_column(con, "active_positions", "gross_unrealized_pnl", "REAL")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS manual_trades (
@@ -1525,6 +1540,11 @@ def init_db(path: Path) -> sqlite3.Connection:
     ensure_column(con, "manual_trades", "strategy", f"TEXT NOT NULL DEFAULT '{MANUAL_STRATEGY}'")
     ensure_column(con, "manual_trades", "market_slug", "TEXT")
     ensure_column(con, "manual_trades", "outcome", "TEXT")
+    ensure_column(con, "manual_trades", "fee_rate", "REAL")
+    ensure_column(con, "manual_trades", "entry_fee", "REAL")
+    ensure_column(con, "manual_trades", "exit_fee", "REAL")
+    ensure_column(con, "manual_trades", "total_fee", "REAL")
+    ensure_column(con, "manual_trades", "gross_pnl", "REAL")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS manual_active_positions (
@@ -1546,6 +1566,11 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    ensure_column(con, "manual_active_positions", "fee_rate", "REAL")
+    ensure_column(con, "manual_active_positions", "entry_fee", "REAL")
+    ensure_column(con, "manual_active_positions", "exit_fee_estimate", "REAL")
+    ensure_column(con, "manual_active_positions", "total_fee_estimate", "REAL")
+    ensure_column(con, "manual_active_positions", "gross_unrealized_pnl", "REAL")
     migrate_legacy_manual_rows(con)
     con.execute(
         """
@@ -1579,9 +1604,11 @@ def migrate_legacy_manual_rows(con: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO manual_trades
         (legacy_trade_id, strategy, label, market_slug, outcome, token_id, entry_ts, exit_ts,
-         entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason)
+         entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason,
+         fee_rate, entry_fee, exit_fee, total_fee, gross_pnl)
         SELECT id, strategy, label, market_slug, outcome, token_id, entry_ts, exit_ts,
-               entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason
+               entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason,
+               fee_rate, entry_fee, exit_fee, total_fee, gross_pnl
         FROM paper_trades
         WHERE strategy = ?
         """,
@@ -1592,9 +1619,11 @@ def migrate_legacy_manual_rows(con: sqlite3.Connection) -> None:
         """
         INSERT OR REPLACE INTO manual_active_positions
         (label, market_slug, outcome, token_id, entry_ts, updated_ts, entry_price, bid, ask,
-         shares, size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason)
+         shares, size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason,
+         fee_rate, entry_fee, exit_fee_estimate, total_fee_estimate, gross_unrealized_pnl)
         SELECT label, market_slug, outcome, token_id, entry_ts, updated_ts, entry_price, bid, ask,
-               shares, size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason
+               shares, size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason,
+               fee_rate, entry_fee, exit_fee_estimate, total_fee_estimate, gross_unrealized_pnl
         FROM active_positions
         WHERE label LIKE ?
         """,
@@ -1625,10 +1654,6 @@ def snapshot_gate() -> IntervalGate:
 
 def status_log_gate() -> IntervalGate:
     return IntervalGate(status_log_interval_seconds())
-
-
-def realtime_loop_sleep_seconds(poll_seconds: int | float) -> float:
-    return min(max(0.05, float(poll_seconds)), DEFAULT_REALTIME_LOOP_SECONDS)
 
 
 def snapshot_raw_json(book: BookTop) -> str | None:
@@ -1748,7 +1773,8 @@ def active_position_values(
     book: BookTop,
     btc_price: float | None,
 ) -> dict[str, Any]:
-    unrealized_pnl = (pos.shares * book.bid - pos.size_usd) if book.bid is not None else None
+    fees = position_fee_values(pos, book.bid)
+    unrealized_pnl = fees["net_pnl"]
     unrealized_roi = (unrealized_pnl / pos.size_usd * 100.0) if unrealized_pnl is not None and pos.size_usd else None
     updated_ts = utc_now()
     return {
@@ -1765,6 +1791,11 @@ def active_position_values(
         "size_usd": pos.size_usd,
         "unrealized_pnl": unrealized_pnl,
         "unrealized_roi": unrealized_roi,
+        "fee_rate": fees["fee_rate"],
+        "entry_fee": fees["entry_fee"],
+        "exit_fee_estimate": fees["exit_fee"],
+        "total_fee_estimate": fees["total_fee"],
+        "gross_unrealized_pnl": fees["gross_pnl"],
         "btc_price": btc_price,
         "entry_reason": pos.reason,
     }
@@ -1782,10 +1813,12 @@ def upsert_active_position(
         """
         INSERT INTO active_positions
         (label, market_slug, outcome, token_id, entry_ts, updated_ts, entry_price, bid, ask, shares,
-         size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason)
+         size_usd, unrealized_pnl, unrealized_roi, fee_rate, entry_fee, exit_fee_estimate,
+         total_fee_estimate, gross_unrealized_pnl, btc_price, entry_reason)
         VALUES
         (:label, :market_slug, :outcome, :token_id, :entry_ts, :updated_ts, :entry_price, :bid, :ask, :shares,
-         :size_usd, :unrealized_pnl, :unrealized_roi, :btc_price, :entry_reason)
+         :size_usd, :unrealized_pnl, :unrealized_roi, :fee_rate, :entry_fee, :exit_fee_estimate,
+         :total_fee_estimate, :gross_unrealized_pnl, :btc_price, :entry_reason)
         ON CONFLICT(label) DO UPDATE SET
             market_slug=excluded.market_slug,
             outcome=excluded.outcome,
@@ -1799,6 +1832,11 @@ def upsert_active_position(
             size_usd=excluded.size_usd,
             unrealized_pnl=excluded.unrealized_pnl,
             unrealized_roi=excluded.unrealized_roi,
+            fee_rate=excluded.fee_rate,
+            entry_fee=excluded.entry_fee,
+            exit_fee_estimate=excluded.exit_fee_estimate,
+            total_fee_estimate=excluded.total_fee_estimate,
+            gross_unrealized_pnl=excluded.gross_unrealized_pnl,
             btc_price=excluded.btc_price,
             entry_reason=excluded.entry_reason
         """,
@@ -1865,22 +1903,23 @@ def auto_entry_precheck(
     market_locked: bool,
     no_entry_after_seconds: int,
     max_sum_asks: float,
+    remaining_seconds: int | None = None,
+    lock_reason: str = "market_locked_after_loss",
 ) -> tuple[bool, str]:
     if market_locked:
-        return False, "market_locked_after_loss"
+        return False, lock_reason
     if max_trades_per_label_per_market > 0 and trade_count >= max_trades_per_label_per_market:
         return False, f"max_trades_reached:{trade_count}>={max_trades_per_label_per_market}"
 
     reasons: list[str] = []
-    if no_entry_after_seconds > 0 and market_start_ts is not None:
-        elapsed = max(0, now_ts - market_start_ts)
-        if elapsed > no_entry_after_seconds:
-            return False, f"entry_after_cutoff:{elapsed}s>{no_entry_after_seconds}s"
-        reasons.append(f"entry_elapsed_ok:{elapsed}s<={no_entry_after_seconds}s")
+    if no_entry_after_seconds > 0 and remaining_seconds is not None:
+        if remaining_seconds <= no_entry_after_seconds:
+            return False, f"entry_too_late:{remaining_seconds}s<={no_entry_after_seconds}s"
+        reasons.append(f"entry_time_ok:{remaining_seconds}s>{no_entry_after_seconds}s")
     elif no_entry_after_seconds > 0:
-        reasons.append("entry_elapsed_unknown")
+        reasons.append("entry_remaining_unknown")
     else:
-        reasons.append("entry_elapsed_unrestricted")
+        reasons.append("entry_time_unrestricted")
 
     if max_sum_asks > 0:
         if book.ask is None:
@@ -1925,7 +1964,36 @@ def should_exit(
 def taker_fee_usdc(shares: float, price: float, fee_rate: float) -> float:
     if shares <= 0 or fee_rate <= 0:
         return 0.0
+    # Polymarket taker fee formula: C * feeRate * p * (1 - p).
+    # Source: https://docs.polymarket.com/trading/fees
     return round(shares * fee_rate * price * (1.0 - price), 5)
+
+
+def position_fee_values(pos: PaperPosition, exit_price: float | None) -> dict[str, float | None]:
+    fee_rate = max(0.0, float(pos.fee_rate or 0.0))
+    entry_fee = max(0.0, float(pos.entry_fee or 0.0))
+    if entry_fee <= 0 and fee_rate > 0:
+        entry_fee = taker_fee_usdc(pos.shares, pos.entry_price, fee_rate)
+    if exit_price is None:
+        return {
+            "fee_rate": fee_rate,
+            "entry_fee": entry_fee,
+            "exit_fee": None,
+            "total_fee": None,
+            "gross_pnl": None,
+            "net_pnl": None,
+        }
+    gross_pnl = pos.shares * exit_price - pos.size_usd
+    exit_fee = taker_fee_usdc(pos.shares, exit_price, fee_rate)
+    total_fee = entry_fee + exit_fee
+    return {
+        "fee_rate": fee_rate,
+        "entry_fee": entry_fee,
+        "exit_fee": exit_fee,
+        "total_fee": total_fee,
+        "gross_pnl": gross_pnl,
+        "net_pnl": gross_pnl - total_fee,
+    }
 
 
 def complete_set_taker_fee(first_price: float, second_price: float, fee_rate: float) -> float:
@@ -1940,13 +2008,14 @@ def record_trade(
     exit_reason: str,
     strategy: str = "directional_scalp",
 ) -> float:
-    pnl = pos.shares * exit_price - pos.size_usd
+    fees = position_fee_values(pos, exit_price)
+    pnl = float(fees["net_pnl"] or 0.0)
     con.execute(
         """
         INSERT INTO paper_trades
         (strategy, label, market_slug, outcome, token_id, entry_ts, exit_ts, entry_price, exit_price, shares,
-         size_usd, pnl, entry_reason, exit_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         size_usd, pnl, entry_reason, exit_reason, fee_rate, entry_fee, exit_fee, total_fee, gross_pnl)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             strategy,
@@ -1963,6 +2032,11 @@ def record_trade(
             pnl,
             pos.reason,
             exit_reason,
+            fees["fee_rate"],
+            fees["entry_fee"],
+            fees["exit_fee"],
+            fees["total_fee"],
+            fees["gross_pnl"],
         ),
     )
     con.commit()
@@ -1981,10 +2055,12 @@ def upsert_manual_active_position(
         """
         INSERT INTO manual_active_positions
         (label, market_slug, outcome, token_id, entry_ts, updated_ts, entry_price, bid, ask, shares,
-         size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason)
+         size_usd, unrealized_pnl, unrealized_roi, fee_rate, entry_fee, exit_fee_estimate,
+         total_fee_estimate, gross_unrealized_pnl, btc_price, entry_reason)
         VALUES
         (:label, :market_slug, :outcome, :token_id, :entry_ts, :updated_ts, :entry_price, :bid, :ask, :shares,
-         :size_usd, :unrealized_pnl, :unrealized_roi, :btc_price, :entry_reason)
+         :size_usd, :unrealized_pnl, :unrealized_roi, :fee_rate, :entry_fee, :exit_fee_estimate,
+         :total_fee_estimate, :gross_unrealized_pnl, :btc_price, :entry_reason)
         ON CONFLICT(label) DO UPDATE SET
             market_slug=excluded.market_slug,
             outcome=excluded.outcome,
@@ -1998,6 +2074,11 @@ def upsert_manual_active_position(
             size_usd=excluded.size_usd,
             unrealized_pnl=excluded.unrealized_pnl,
             unrealized_roi=excluded.unrealized_roi,
+            fee_rate=excluded.fee_rate,
+            entry_fee=excluded.entry_fee,
+            exit_fee_estimate=excluded.exit_fee_estimate,
+            total_fee_estimate=excluded.total_fee_estimate,
+            gross_unrealized_pnl=excluded.gross_unrealized_pnl,
             btc_price=excluded.btc_price,
             entry_reason=excluded.entry_reason
         """,
@@ -2018,13 +2099,15 @@ def record_manual_trade(
     exit_price: float,
     exit_reason: str,
 ) -> float:
-    pnl = pos.shares * exit_price - pos.size_usd
+    fees = position_fee_values(pos, exit_price)
+    pnl = float(fees["net_pnl"] or 0.0)
     con.execute(
         """
         INSERT INTO manual_trades
         (legacy_trade_id, strategy, label, market_slug, outcome, token_id, entry_ts, exit_ts,
-         entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         entry_price, exit_price, shares, size_usd, pnl, entry_reason, exit_reason,
+         fee_rate, entry_fee, exit_fee, total_fee, gross_pnl)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             None,
@@ -2042,6 +2125,11 @@ def record_manual_trade(
             pnl,
             pos.reason,
             exit_reason,
+            fees["fee_rate"],
+            fees["entry_fee"],
+            fees["exit_fee"],
+            fees["total_fee"],
+            fees["gross_pnl"],
         ),
     )
     con.commit()
@@ -2125,10 +2213,12 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
     status_logs = status_log_gate()
     book_client = PolymarketMarketWsClient([cfg.token_id])
     clock = PolymarketClock()
+    active_fee_rate = resolve_fee_rate([cfg.token_id], DEFAULT_TAKER_FEE_RATE)
     book_client.start()
     if needs_reference:
         fetch_reference_price(cfg.resolution_source)
     print(f"[{iso()}] paper watch started: {cfg.label}")
+    print(f"Fee rate: {active_fee_rate:.6f}")
     print("No wallet. No private key. No real orders.")
     while utc_now() < end_ts:
         remaining, clock_snapshot = market_remaining_seconds(end_ts, clock)
@@ -2144,12 +2234,20 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
                 if not clock_snapshot.fresh:
                     if status_logs.allow(f"watch:{cfg.label}", now_ts):
                         print(f"[{iso()}] watch bid={book.bid} ask={book.ask} reason=clock_stale source={clock_snapshot.source}")
-                    time.sleep(realtime_loop_sleep_seconds(cfg.poll))
+                    time.sleep(DEFAULT_REALTIME_LOOP_SECONDS)
                     continue
                 enter, reason = should_enter(cfg, book, btc, remaining)
                 if enter and book.ask:
                     shares = cfg.size_usd / book.ask
-                    position = PaperPosition(utc_now(), book.ask, shares, cfg.size_usd, reason)
+                    position = PaperPosition(
+                        utc_now(),
+                        book.ask,
+                        shares,
+                        cfg.size_usd,
+                        reason,
+                        fee_rate=active_fee_rate,
+                        entry_fee=taker_fee_usdc(shares, book.ask, active_fee_rate),
+                    )
                     upsert_active_position(con, cfg, position, book, btc)
                     print(
                         f"[{iso()}] PAPER ENTER ask={book.ask:.3f} shares={shares:.4f} "
@@ -2170,7 +2268,7 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
                     position = None
                 else:
                     upsert_active_position(con, cfg, position, book, btc)
-                    unrealized = (position.shares * book.bid - position.size_usd) if book.bid else math.nan
+                    unrealized = position_fee_values(position, book.bid)["net_pnl"] if book.bid is not None else math.nan
                     if status_logs.allow(f"hold:{cfg.label}", now_ts):
                         print(
                             f"[{iso()}] hold bid={book.bid} ask={book.ask} unrealized={unrealized:.4f} "
@@ -2178,7 +2276,7 @@ def watch_directional(cfg: DirectionalConfig, db_path: Path) -> None:
                         )
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(realtime_loop_sleep_seconds(cfg.poll))
+        time.sleep(DEFAULT_REALTIME_LOOP_SECONDS)
     book_client.stop()
     delete_active_position(con, cfg)
     print(f"[{iso()}] paper watch ended: {cfg.label}")
@@ -2190,7 +2288,6 @@ def watch_arb(
     label: str,
     buffer: float,
     fee_rate: float,
-    poll: int,
     seconds: int,
     db_path: Path,
 ) -> None:
@@ -2248,7 +2345,7 @@ def watch_arb(
                 print(f"[{iso()}] arb watch yes_bid={yes.bid} yes_ask={yes.ask} no_bid={no.bid} no_ask={no.ask}")
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as exc:
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(realtime_loop_sleep_seconds(poll))
+        time.sleep(DEFAULT_REALTIME_LOOP_SECONDS)
     book_client.stop()
     print(f"[{iso()}] arb watch ended: {label}")
 
@@ -2277,7 +2374,6 @@ def watch_url(
     url_or_slug: str,
     db_path: Path,
     seconds: int | None,
-    poll: int,
     size_usd: float,
     entry_min: float,
     entry_max: float,
@@ -2290,6 +2386,7 @@ def watch_url(
     entry_window_seconds: int,
     max_trades_per_label_per_market: int,
     market_lock_after_loss: bool,
+    loss_lock_scope: str,
     no_entry_after_seconds: int,
     max_sum_asks: float,
     arb_buffer: float,
@@ -2344,6 +2441,7 @@ def watch_url(
     if needs_reference:
         fetch_reference_price(market.resolution_source)
     active_fee_rate = resolve_fee_rate([outcome.token_id for outcome in market.outcomes], fee_rate)
+    write_run_metadata(db_path, {"active_fee_rate": active_fee_rate})
     end_ts = default_end_ts(market, seconds, end_buffer_seconds)
     run_seconds = max(0, end_ts - utc_now())
     con = init_db(db_path)
@@ -2363,7 +2461,9 @@ def watch_url(
     clear_active_positions(con, market.slug)
     positions: dict[str, PaperPosition | None] = {}
     trade_counts: dict[str, int] = {}
+    effective_lock_scope = effective_loss_lock_scope(market_lock_after_loss, loss_lock_scope)
     market_locked = False
+    preset_locks: dict[str, bool] = {}
     snapshots = snapshot_gate()
     status_logs = status_log_gate()
     configs: list[DirectionalConfig] = []
@@ -2372,6 +2472,7 @@ def watch_url(
         for preset in active_presets
     }
     for preset in active_presets:
+        preset_locks[str(preset["key"])] = False
         for index, outcome in enumerate(market.outcomes):
             label = f"{market.slug} {outcome.name} preset:{preset['key']}"
             configs.append(
@@ -2394,7 +2495,6 @@ def watch_url(
                     late_seconds=int(preset["late_seconds"]),
                     entry_window_seconds=max(0, entry_window_seconds) or None,
                     min_distance_usd=float(preset["min_distance_usd"]),
-                    poll=poll,
                     seconds=run_seconds,
                     resolution_source=market.resolution_source,
                 )
@@ -2429,7 +2529,7 @@ def watch_url(
         )
     print(
         f"Risk guards: max_trades_per_label={max_trades_per_label_per_market} "
-        f"market_lock_after_loss={market_lock_after_loss} no_entry_after={no_entry_after_seconds}s "
+        f"loss_lock_scope={effective_lock_scope} no_entry_when_remaining_le={no_entry_after_seconds}s "
         f"max_sum_asks={max_sum_asks:.3f}"
     )
     print(f"Fee rate: {active_fee_rate:.6f}; extra arb buffer: {arb_buffer:.6f}")
@@ -2477,9 +2577,19 @@ def watch_url(
                         market_start_ts=market.start_ts,
                         trade_count=trade_counts[cfg.label],
                         max_trades_per_label_per_market=max(0, preset_trade_limits[cfg.preset_key]),
-                        market_locked=market_locked,
+                        market_locked=(
+                            market_locked
+                            if effective_lock_scope == "market"
+                            else preset_locks.get(cfg.preset_key, False) if effective_lock_scope == "preset" else False
+                        ),
                         no_entry_after_seconds=max(0, no_entry_after_seconds),
                         max_sum_asks=max(0.0, max_sum_asks) if len(market.outcomes) == 2 else 0.0,
+                        remaining_seconds=remaining,
+                        lock_reason=(
+                            "market_locked_after_loss"
+                            if effective_lock_scope == "market"
+                            else "preset_locked_after_loss"
+                        ),
                     )
                     if not precheck_ok:
                         if status_logs.allow(f"watch:{cfg.label}", now_ts):
@@ -2489,7 +2599,15 @@ def watch_url(
                     reason = f"{precheck_reason};{reason}"
                     if enter and book.ask:
                         shares = cfg.size_usd / book.ask
-                        positions[cfg.label] = PaperPosition(utc_now(), book.ask, shares, cfg.size_usd, reason)
+                        positions[cfg.label] = PaperPosition(
+                            utc_now(),
+                            book.ask,
+                            shares,
+                            cfg.size_usd,
+                            reason,
+                            fee_rate=active_fee_rate,
+                            entry_fee=taker_fee_usdc(shares, book.ask, active_fee_rate),
+                        )
                         upsert_active_position(con, cfg, positions[cfg.label], book, btc)
                         print(f"[{iso()}] ENTER {cfg.label} ask={book.ask:.3f} shares={shares:.4f} reason={reason}")
                     else:
@@ -2502,12 +2620,14 @@ def watch_url(
                         delete_active_position(con, cfg)
                         positions[cfg.label] = None
                         trade_counts[cfg.label] += 1
-                        if market_lock_after_loss and pnl < 0:
+                        if pnl < 0 and effective_lock_scope == "market":
                             market_locked = True
+                        elif pnl < 0 and effective_lock_scope == "preset":
+                            preset_locks[cfg.preset_key] = True
                         print(f"[{iso()}] EXIT {cfg.label} bid={book.bid:.3f} pnl={pnl:.4f} reason={reason}")
                     else:
                         upsert_active_position(con, cfg, pos, book, btc)
-                        unrealized = (pos.shares * book.bid - pos.size_usd) if book.bid else math.nan
+                        unrealized = position_fee_values(pos, book.bid)["net_pnl"] if book.bid is not None else math.nan
                         if status_logs.allow(f"hold:{cfg.label}", now_ts):
                             print(f"[{iso()}] HOLD {cfg.label} bid={book.bid} unrealized={unrealized:.4f}")
             first, second = market.outcomes[0], market.outcomes[1]
@@ -2551,7 +2671,7 @@ def watch_url(
                 print(f"[{iso()}] market ended; Polymarket CLOB book stream closed, moving to next market")
                 break
             print(f"[{iso()}] fetch/error: {exc}", file=sys.stderr)
-        time.sleep(realtime_loop_sleep_seconds(poll))
+        time.sleep(DEFAULT_REALTIME_LOOP_SECONDS)
     book_client.stop()
     clear_active_positions(con, market.slug)
     print(f"[{iso()}] auto paper watch ended: {market.title}")
@@ -2564,7 +2684,6 @@ def watch_chain(
     interval_seconds: int,
     db_path: Path,
     seconds: int | None,
-    poll: int,
     size_usd: float,
     entry_min: float,
     entry_max: float,
@@ -2577,6 +2696,7 @@ def watch_chain(
     entry_window_seconds: int,
     max_trades_per_label_per_market: int,
     market_lock_after_loss: bool,
+    loss_lock_scope: str,
     no_entry_after_seconds: int,
     max_sum_asks: float,
     arb_buffer: float,
@@ -2597,7 +2717,6 @@ def watch_chain(
             url_or_slug=current,
             db_path=db_path,
             seconds=seconds,
-            poll=poll,
             size_usd=size_usd,
             entry_min=entry_min,
             entry_max=entry_max,
@@ -2610,6 +2729,7 @@ def watch_chain(
             entry_window_seconds=entry_window_seconds,
             max_trades_per_label_per_market=max_trades_per_label_per_market,
             market_lock_after_loss=market_lock_after_loss,
+            loss_lock_scope=loss_lock_scope,
             no_entry_after_seconds=no_entry_after_seconds,
             max_sum_asks=max_sum_asks,
             arb_buffer=arb_buffer,
@@ -2637,7 +2757,8 @@ def report(db_path: Path, label_like: str | None = None) -> None:
     trade_params = tuple(trade_params_list)
     rows = con.execute(
         f"""
-        SELECT label, COUNT(*), SUM(pnl), AVG(pnl), MIN(pnl), MAX(pnl)
+        SELECT label, COUNT(*), SUM(pnl), AVG(pnl), MIN(pnl), MAX(pnl),
+               SUM(COALESCE(total_fee, 0))
         FROM paper_trades
         {trade_where}
         GROUP BY label
@@ -2648,8 +2769,8 @@ def report(db_path: Path, label_like: str | None = None) -> None:
     print("Paper trades")
     if not rows:
         print("  No paper trades yet.")
-    for label, count, total, avg, worst, best in rows:
-        print(f"  {label}: trades={count} pnl={total:.4f} avg={avg:.4f} worst={worst:.4f} best={best:.4f}")
+    for label, count, total, avg, worst, best, fees in rows:
+        print(f"  {label}: trades={count} pnl={total:.4f} fees={fees:.4f} avg={avg:.4f} worst={worst:.4f} best={best:.4f}")
     exits = con.execute(
         f"""
         SELECT exit_reason, COUNT(*), SUM(pnl)
@@ -2691,13 +2812,15 @@ def summary(db_path: Path, limit: int, export_csv: Path | None = None) -> None:
         """
         SELECT COUNT(*), COALESCE(SUM(pnl), 0), COALESCE(AVG(pnl), 0),
                COALESCE(MIN(pnl), 0), COALESCE(MAX(pnl), 0),
-               COALESCE(SUM(size_usd), 0)
+               COALESCE(SUM(size_usd), 0),
+               COALESCE(SUM(COALESCE(gross_pnl, pnl)), 0),
+               COALESCE(SUM(COALESCE(total_fee, 0)), 0)
         FROM paper_trades
         WHERE strategy != ?
         """,
         bot_trade_params,
     ).fetchone()
-    count, pnl, avg, worst, best, volume = total
+    count, pnl, avg, worst, best, volume, gross_pnl, total_fee = total
     print("Overall paper performance")
     if count == 0:
         print("  No paper trades yet.")
@@ -2708,7 +2831,7 @@ def summary(db_path: Path, limit: int, export_csv: Path | None = None) -> None:
         ).fetchone()[0]
         roi = (pnl / volume * 100.0) if volume else 0.0
         print(f"  trades={count} pnl={pnl:.4f} avg={avg:.4f} win_rate={win_rate:.1f}% roi_on_paper_size={roi:.1f}%")
-        print(f"  worst={worst:.4f} best={best:.4f} paper_size={volume:.2f}")
+        print(f"  gross_pnl={gross_pnl:.4f} fees={total_fee:.4f} worst={worst:.4f} best={best:.4f} paper_size={volume:.2f}")
 
     print("\nBy market")
     market_rows = con.execute(
@@ -2786,7 +2909,8 @@ def summary(db_path: Path, limit: int, export_csv: Path | None = None) -> None:
             f"""
             SELECT {slug_expr()} AS market_slug, strategy, {outcome_expr()} AS outcome,
                    label, entry_ts, exit_ts, entry_price, exit_price, shares,
-                   size_usd, pnl, entry_reason, exit_reason
+                   size_usd, pnl, fee_rate, entry_fee, exit_fee, total_fee, gross_pnl,
+                   entry_reason, exit_reason
             FROM paper_trades
             WHERE strategy != ?
             ORDER BY exit_ts
@@ -2805,6 +2929,11 @@ def summary(db_path: Path, limit: int, export_csv: Path | None = None) -> None:
             "shares",
             "size_usd",
             "pnl",
+            "fee_rate",
+            "entry_fee",
+            "exit_fee",
+            "total_fee",
+            "gross_pnl",
             "entry_reason",
             "exit_reason",
         ]
@@ -2824,6 +2953,41 @@ def csv_cell(value: Any) -> str:
 
 def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def enrich_preset_research_metrics(
+    preset_summary: list[dict[str, Any]],
+    preset_equity: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    drawdown_state: dict[str, dict[str, float]] = {}
+    for row in preset_equity:
+        key = str(row.get("preset_key") or "legacy")
+        state = drawdown_state.setdefault(key, {"peak": 0.0, "max_drawdown": 0.0})
+        cumulative = float(row.get("cumulative") or 0.0)
+        state["peak"] = max(state["peak"], cumulative)
+        state["max_drawdown"] = max(state["max_drawdown"], state["peak"] - cumulative)
+
+    for row in preset_summary:
+        trades = int(row.get("trades") or 0)
+        gross_profit = float(row.get("gross_profit") or 0.0)
+        gross_loss = abs(float(row.get("gross_loss") or 0.0))
+        row["gross_profit"] = gross_profit
+        row["gross_loss"] = gross_loss
+        row["profit_factor_infinite"] = gross_profit > 0 and gross_loss <= 0
+        row["profit_factor"] = None if row["profit_factor_infinite"] else (gross_profit / gross_loss if gross_loss > 0 else 0.0)
+        row["max_drawdown"] = drawdown_state.get(str(row.get("preset_key") or "legacy"), {}).get("max_drawdown", 0.0)
+        row["stop_loss_rate"] = (float(row.get("risk_exits") or 0) / trades * 100.0) if trades else 0.0
+
+    def rank_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        profit_factor_rank = 1_000_000.0 if row.get("profit_factor_infinite") else float(row.get("profit_factor") or 0.0)
+        return (
+            profit_factor_rank,
+            float(row.get("pnl") or 0.0),
+            -float(row.get("max_drawdown") or 0.0),
+            float(row.get("trades") or 0.0),
+        )
+
+    return sorted((dict(row) for row in preset_summary), key=rank_key, reverse=True)
 
 
 def read_run_metadata(con: sqlite3.Connection) -> dict[str, Any]:
@@ -3130,7 +3294,6 @@ def manual_trade_config(token_id: str, market_slug: str, outcome: str) -> Direct
         late_seconds=0,
         entry_window_seconds=None,
         min_distance_usd=0.0,
-        poll=DEFAULT_POLL_SECONDS,
         seconds=UPDOWN_5M_DURATION_SECONDS,
     )
 
@@ -3183,6 +3346,7 @@ def manual_account_state(con: sqlite3.Connection, run_metadata: dict[str, Any]) 
     raw_total_pnl = closed_pnl + unrealized_pnl
     total_pnl = raw_total_pnl - float(settings["pnl_baseline"])
     budget = float(settings["budget_usd"])
+    available_budget_usd = max(0.0, budget + closed_pnl - open_size_usd)
     return {
         **settings,
         "trades": int(closed["trades"] if isinstance(closed, sqlite3.Row) else closed[0]),
@@ -3193,7 +3357,7 @@ def manual_account_state(con: sqlite3.Connection, run_metadata: dict[str, Any]) 
         "total_pnl": total_pnl,
         "closed_size_usd": float(closed["closed_size_usd"] if isinstance(closed, sqlite3.Row) else closed[2]),
         "open_size_usd": open_size_usd,
-        "available_budget_usd": max(0.0, budget - open_size_usd),
+        "available_budget_usd": available_budget_usd,
     }
 
 
@@ -3437,6 +3601,7 @@ def manual_trade_state(
             "position_shares": position.get("shares") if position else 0.0,
             "position_size_usd": position.get("size_usd") if position else 0.0,
             "position_entry_price": position.get("entry_price") if position else None,
+            "position_average_price": position.get("entry_price") if position else None,
             "position_unrealized_pnl": position.get("unrealized_pnl") if position else None,
             "position_unrealized_roi": position.get("unrealized_roi") if position else None,
         }
@@ -3592,10 +3757,12 @@ def empty_dashboard_payload(db_path: Path) -> dict[str, Any]:
         "equity": [],
         "preset_equity": [],
         "preset_summary": [],
+        "preset_rankings": [],
         "markets": [],
         "outcomes": [],
         "exits": [],
         "trades": [],
+        "manual_trades": [],
         "active_positions": [],
         "market_reference": {
             "target_price": None,
@@ -3656,6 +3823,8 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
         """
         SELECT COUNT(*) AS trades,
                COALESCE(SUM(pnl), 0) AS pnl,
+               COALESCE(SUM(COALESCE(gross_pnl, pnl)), 0) AS gross_pnl,
+               COALESCE(SUM(COALESCE(total_fee, 0)), 0) AS total_fee,
                COALESCE(AVG(pnl), 0) AS avg_pnl,
                COALESCE(MIN(pnl), 0) AS worst,
                COALESCE(MAX(pnl), 0) AS best,
@@ -3707,7 +3876,11 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
             SELECT {preset_expr()} AS preset_key, COUNT(*) AS trades, SUM(pnl) AS pnl,
                    AVG(pnl) AS avg_pnl, {win_rate_expr()} AS win_rate,
                    AVG(entry_price) AS avg_entry, AVG(exit_price) AS avg_exit,
+                   SUM(COALESCE(total_fee, 0)) AS total_fee,
+                   SUM(COALESCE(gross_pnl, pnl)) AS gross_pnl,
                    MIN(pnl) AS worst, MAX(pnl) AS best,
+                   SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) AS gross_profit,
+                   ABS(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END)) AS gross_loss,
                    SUM(CASE WHEN exit_reason = 'stop_loss' THEN 1 ELSE 0 END) AS risk_exits
             FROM paper_trades
             WHERE strategy != ?
@@ -3717,7 +3890,9 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
             bot_trade_params,
         ).fetchall()
     )
+    preset_rankings = enrich_preset_research_metrics(preset_summary, preset_equity)
     add_preset_names(preset_summary, preset_names)
+    add_preset_names(preset_rankings, preset_names)
 
     markets = rows_to_dicts(
         con.execute(
@@ -3772,11 +3947,10 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
             SELECT {slug_expr()} AS market_slug, strategy, label, {preset_expr()} AS preset_key,
                    {outcome_expr()} AS outcome,
                    entry_ts, exit_ts, entry_price, exit_price, shares, size_usd, pnl,
-                   entry_reason, exit_reason
+                   fee_rate, entry_fee, exit_fee, total_fee, gross_pnl, entry_reason, exit_reason
             FROM paper_trades
             WHERE strategy != ?
             ORDER BY exit_ts DESC, id DESC
-            LIMIT 250
             """,
             bot_trade_params,
         ).fetchall()
@@ -3787,6 +3961,24 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
         trade["hold_seconds"] = int(trade["exit_ts"] or 0) - int(trade["entry_ts"] or 0)
     add_preset_names(trades, preset_names)
 
+    manual_trades = rows_to_dicts(
+        con.execute(
+            f"""
+            SELECT {slug_expr()} AS market_slug, strategy, label, {preset_expr()} AS preset_key,
+                   {outcome_expr()} AS outcome,
+                   entry_ts, exit_ts, entry_price, exit_price, shares, size_usd, pnl,
+                   fee_rate, entry_fee, exit_fee, total_fee, gross_pnl, entry_reason, exit_reason
+            FROM manual_trades
+            ORDER BY exit_ts DESC, id DESC
+            """
+        ).fetchall()
+    )
+    for trade in manual_trades:
+        trade["entry_time"] = iso(int(trade["entry_ts"])) if trade["entry_ts"] else ""
+        trade["exit_time"] = iso(int(trade["exit_ts"])) if trade["exit_ts"] else ""
+        trade["hold_seconds"] = int(trade["exit_ts"] or 0) - int(trade["entry_ts"] or 0)
+    add_preset_names(manual_trades, preset_names)
+
     active_positions = rows_to_dicts(
         con.execute(
             """
@@ -3796,7 +3988,8 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
                        ELSE 'legacy'
                    END AS preset_key,
                    market_slug, outcome, token_id, entry_ts, updated_ts, entry_price, bid, ask,
-                   shares, size_usd, unrealized_pnl, unrealized_roi, btc_price, entry_reason
+                   shares, size_usd, unrealized_pnl, unrealized_roi, fee_rate, entry_fee,
+                   exit_fee_estimate, total_fee_estimate, gross_unrealized_pnl, btc_price, entry_reason
             FROM active_positions
             WHERE label NOT LIKE ?
             ORDER BY updated_ts DESC
@@ -3903,10 +4096,12 @@ def dashboard_payload(db_path: Path) -> dict[str, Any]:
         "equity": equity,
         "preset_equity": preset_equity,
         "preset_summary": preset_summary,
+        "preset_rankings": preset_rankings,
         "markets": markets,
         "outcomes": outcomes,
         "exits": exits,
         "trades": trades,
+        "manual_trades": manual_trades,
         "active_positions": active_positions,
         "market_reference": market_reference,
         "manual_trade": manual_state,
@@ -4155,6 +4350,26 @@ def bool_value(value: Any, default: bool) -> bool:
     return default
 
 
+def normalize_loss_lock_scope(value: Any, default: str = DEFAULT_LOSS_LOCK_SCOPE) -> str:
+    normalized = str(value or default).strip().lower().replace("_", "-")
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "no": "none",
+        "per-preset": "preset",
+        "preset-only": "preset",
+        "global": "market",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in LOSS_LOCK_SCOPES else default
+
+
+def effective_loss_lock_scope(market_lock_after_loss: bool, loss_lock_scope: Any) -> str:
+    if not market_lock_after_loss:
+        return "none"
+    return normalize_loss_lock_scope(loss_lock_scope)
+
+
 def compact_number(value: Any, digits: int = 3) -> str:
     try:
         number = float(value)
@@ -4171,7 +4386,11 @@ def safe_filename_segment(value: str, max_len: int = 96) -> str:
 
 
 def strategy_label(config: dict[str, Any]) -> str:
-    lock = "lock" if config.get("market_lock_after_loss") else "nolock"
+    scope = effective_loss_lock_scope(
+        bool(config.get("market_lock_after_loss", DEFAULT_MARKET_LOCK_AFTER_LOSS)),
+        config.get("loss_lock_scope", DEFAULT_LOSS_LOCK_SCOPE),
+    )
+    lock = f"lock-{scope}" if scope != "none" else "nolock"
     preset = primary_preset(config)
     enabled = [item for item in config.get("presets", []) if item.get("enabled", True)]
     preset_part = (
@@ -4428,6 +4647,10 @@ def stop_process_id(pid: int) -> None:
 
 def bot_command(config: dict[str, Any], db_path: Path) -> list[str]:
     preset = primary_preset(config)
+    lock_scope = effective_loss_lock_scope(
+        bool(config.get("market_lock_after_loss", DEFAULT_MARKET_LOCK_AFTER_LOSS)),
+        config.get("loss_lock_scope", DEFAULT_DASHBOARD_LOSS_LOCK_SCOPE),
+    )
     args = [
         sys.executable,
         "-u",
@@ -4436,8 +4659,6 @@ def bot_command(config: dict[str, Any], db_path: Path) -> list[str]:
         str(db_path),
         "watch-url",
         config["url"],
-        "--poll",
-        str(config["poll"]),
         "--size-usd",
         str(config["size_usd"]),
         "--entry-min",
@@ -4474,9 +4695,11 @@ def bot_command(config: dict[str, Any], db_path: Path) -> list[str]:
         str(config["chain_interval_seconds"]),
         "--lookup-timeout-seconds",
         str(config["lookup_timeout_seconds"]),
+        "--loss-lock-scope",
+        lock_scope,
     ]
     args.extend(["--presets", json.dumps(config["presets"], separators=(",", ":"))])
-    args.append("--market-lock-after-loss" if config["market_lock_after_loss"] else "--no-market-lock-after-loss")
+    args.append("--market-lock-after-loss" if lock_scope != "none" else "--no-market-lock-after-loss")
     if config.get("seconds") is not None:
         args.extend(["--seconds", str(config["seconds"])])
     return args
@@ -4488,9 +4711,17 @@ def normalize_bot_config(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("URL or slug is required")
     presets = normalize_presets(payload)
     preset = next((item for item in presets if item["enabled"]), presets[0])
+    submitted_lock_scope = normalize_loss_lock_scope(
+        payload.get("loss_lock_scope"),
+        default=DEFAULT_DASHBOARD_LOSS_LOCK_SCOPE,
+    )
+    market_lock_after_loss = bool_value(
+        payload.get("market_lock_after_loss"),
+        submitted_lock_scope != "none",
+    )
+    loss_lock_scope = effective_loss_lock_scope(market_lock_after_loss, submitted_lock_scope)
     return {
         "url": url,
-        "poll": bounded_int(payload.get("poll"), DEFAULT_POLL_SECONDS, 1, 60),
         "chain_count": bounded_int(payload.get("chain_count"), DEFAULT_CHAIN_COUNT, 1, 100),
         "chain_interval_seconds": bounded_int(payload.get("chain_interval_seconds"), 300, 1, 3600),
         "lookup_timeout_seconds": bounded_int(payload.get("lookup_timeout_seconds"), 60, 1, 600),
@@ -4518,7 +4749,8 @@ def normalize_bot_config(payload: dict[str, Any]) -> dict[str, Any]:
             0,
             100,
         ),
-        "market_lock_after_loss": bool_value(payload.get("market_lock_after_loss"), DEFAULT_MARKET_LOCK_AFTER_LOSS),
+        "market_lock_after_loss": loss_lock_scope != "none",
+        "loss_lock_scope": loss_lock_scope,
         "no_entry_after_seconds": bounded_int(
             payload.get("no_entry_after_seconds"),
             DEFAULT_NO_ENTRY_AFTER_SECONDS,
@@ -4526,7 +4758,7 @@ def normalize_bot_config(payload: dict[str, Any]) -> dict[str, Any]:
             3600,
         ),
         "max_sum_asks": bounded_float(payload.get("max_sum_asks"), DEFAULT_MAX_SUM_ASKS, 0.0, 2.0),
-        "arb_buffer": bounded_float(payload.get("arb_buffer"), 0.01, 0.0, 1.0),
+        "arb_buffer": bounded_float(payload.get("arb_buffer"), DEFAULT_ARB_BUFFER, 0.0, 1.0),
         "fee_rate": bounded_float(payload.get("fee_rate"), DEFAULT_TAKER_FEE_RATE, 0.0, 1.0),
     }
 
@@ -4698,566 +4930,6 @@ def bot_status() -> dict[str, Any]:
     }
 
 
-DASHBOARD_HTML_OLD = r"""<!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Polymarket Paper Console</title>
-  <style>
-    :root {
-      --bg: #0d1110;
-      --bg-2: #101716;
-      --surface: #151b1a;
-      --surface-2: #1b2422;
-      --ink: #eef4f1;
-      --muted: #91a09b;
-      --border: #2a3633;
-      --accent: #1aa896;
-      --accent-2: #d6a93d;
-      --good: #49d18f;
-      --bad: #ff6b6b;
-      --warn: #f4bd50;
-      --info: #6db7ff;
-      --soft: #1c2a27;
-      --line: #24302d;
-      --terminal: #090d0c;
-      --radius: 8px;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100dvh; background: radial-gradient(circle at top left, #14201d 0, var(--bg) 420px); color: var(--ink); }
-    header { position: sticky; top: 0; z-index: 2; background: rgba(13,17,16,.9); border-bottom: 1px solid var(--border); backdrop-filter: blur(14px); }
-    .wrap { width: min(100% - 48px, 1880px); margin: 0 auto; padding: 14px 0; }
-    .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-    h1 { font-size: 22px; margin: 0; line-height: 1.15; letter-spacing: 0; }
-    .subtle { color: var(--muted); font-size: 13px; }
-    .statusline { display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: #60706a; display: inline-block; }
-    .dot.on { background: var(--good); box-shadow: 0 0 0 4px rgba(22,118,79,.12); }
-    .tabs { display: flex; gap: 6px; margin-top: 16px; }
-    .tab { border: 1px solid var(--border); background: var(--surface); color: var(--muted); padding: 8px 12px; border-radius: var(--radius); cursor: pointer; font-size: 14px; }
-    .tab:hover { color: var(--ink); background: var(--surface-2); }
-    .tab.active { background: var(--accent); color: #06100e; border-color: var(--accent); }
-    main { width: min(100% - 48px, 1880px); margin: 0 auto; padding: 16px 0 40px; }
-    .grid { display: grid; gap: 12px; }
-    .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-    .two { grid-template-columns: minmax(0, 1.4fr) minmax(320px, .8fr); }
-    .run-grid { grid-template-columns: minmax(620px, .95fr) minmax(760px, 1.25fr); align-items: start; }
-    .panel { background: linear-gradient(180deg, rgba(27,36,34,.96), rgba(21,27,26,.96)); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 18px 40px rgba(0,0,0,.22); }
-    .metric .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-    .metric .value { font-size: 24px; margin-top: 8px; font-weight: 680; }
-    .pos { color: var(--good); }
-    .neg { color: var(--bad); }
-    h2 { font-size: 15px; margin: 0 0 12px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; border-bottom: 1px solid var(--border); padding: 9px 8px; vertical-align: top; }
-    th { color: var(--muted); font-weight: 620; background: #111715; position: sticky; top: 0; }
-    .table-scroll { max-height: 520px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
-    .chart { width: 100%; height: 260px; display: block; background: linear-gradient(#101614, #0d1110); border: 1px solid var(--border); border-radius: var(--radius); }
-    .hidden { display: none; }
-    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
-    input, select { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; background: #0f1514; min-height: 36px; color: var(--ink); }
-    input::placeholder { color: #60706a; }
-    input:disabled, select:disabled { opacity: .62; cursor: not-allowed; background: #111716; }
-    input:focus, select:focus, button:focus { outline: 2px solid rgba(15,118,110,.28); outline-offset: 2px; }
-    button { border: 1px solid var(--border); background: #111715; color: var(--ink); padding: 8px 12px; border-radius: var(--radius); cursor: pointer; min-height: 36px; font-weight: 650; }
-    button:hover { border-color: #3b4c47; background: #18211f; }
-    button:disabled { cursor: not-allowed; opacity: .45; }
-    button:active { transform: translateY(1px); }
-    .primary { background: var(--accent); border-color: var(--accent); color: #06100e; }
-    .primary:hover:not(:disabled) { background: #35d5c2; border-color: #35d5c2; color: #03100e; box-shadow: 0 0 0 3px rgba(53,213,194,.16); }
-    .primary:disabled:hover { background: var(--accent); border-color: var(--accent); color: #06100e; }
-    .danger { border-color: #e5b7b7; color: var(--bad); }
-    .control-panel { height: auto; min-height: 0; overflow: visible; }
-    .terminal-panel { height: min(760px, calc(100dvh - 165px)); min-height: 560px; }
-    .terminal-panel { display: flex; flex-direction: column; min-height: 0; }
-    .terminal { flex: 1; background: var(--terminal); color: #c8d6d1; border: 1px solid #26322f; border-radius: var(--radius); padding: 12px; min-height: 0; max-height: none; overflow: auto; overflow-wrap: anywhere; scrollbar-width: none; -ms-overflow-style: none; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; box-shadow: inset 0 0 0 1px rgba(255,255,255,.02); }
-    .terminal::-webkit-scrollbar { display: none; width: 0; height: 0; }
-    .terminal .log-line { display: block; min-height: 18px; }
-    .terminal .log-time { color: #708079; }
-    .terminal .log-start { color: var(--accent); font-weight: 700; }
-    .terminal .log-target { color: #ffd84d; font-weight: 800; text-shadow: 0 0 12px rgba(255, 216, 77, .22); }
-    .terminal .log-watch { color: #aab7b2; }
-    .terminal .log-enter { color: var(--good); font-weight: 700; }
-    .terminal .log-exit { color: var(--info); font-weight: 700; }
-    .terminal .log-arb { color: var(--warn); font-weight: 700; }
-    .terminal .log-hold { color: #8ec7ff; }
-    .terminal .log-end { color: #d8c27a; }
-    .terminal .log-error { color: var(--bad); font-weight: 700; }
-    .terminal .log-muted { color: #73827d; }
-    .form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .form-grid .wide { grid-column: 1 / -1; }
-    .span-2 { grid-column: span 2; }
-    .section-title { grid-column: 1 / -1; color: var(--accent-2); font-size: 12px; font-weight: 750; margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--line); }
-    .checkline { display: flex; align-items: center; gap: 9px; min-height: 36px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: #0f1514; color: var(--ink); }
-    .checkline input { width: 16px; min-height: 16px; accent-color: var(--accent); }
-    .command-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-    .notice { margin-top: 12px; padding: 10px; background: var(--soft); border: 1px solid var(--border); border-radius: var(--radius); color: var(--ink); font-size: 13px; }
-    .pill { display: inline-flex; padding: 3px 8px; border-radius: 999px; background: var(--soft); color: var(--ink); font-size: 12px; }
-    .data-pill { max-width: min(720px, 52vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .stacked { display: grid; gap: 3px; min-width: 0; }
-    .stacked strong { color: var(--ink); font-weight: 720; }
-    .pnl-pair { display: inline-grid; gap: 2px; font-weight: 760; }
-    .risk { border-left: 4px solid var(--warn); }
-    .empty { color: var(--muted); padding: 24px; text-align: center; }
-    @media (max-width: 1320px) { .run-grid { grid-template-columns: 1fr; } .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-    @media (max-width: 900px) { .wrap, main { width: min(100% - 28px, 1880px); } .metrics, .two, .run-grid, .form-grid { grid-template-columns: 1fr; } .form-grid .wide, .span-2 { grid-column: auto; } .topbar { align-items: flex-start; flex-direction: column; } .statusline { justify-content: flex-start; } .control-panel { height: auto; min-height: 0; } .terminal-panel { height: 560px; } }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="wrap">
-      <div class="topbar">
-        <div>
-          <h1>Polymarket Paper Console</h1>
-          <div class="subtle" id="generated">Loading paper data...</div>
-        </div>
-        <div class="statusline">
-          <span class="dot" id="botDot"></span>
-          <span class="subtle" id="botStatus">Bot idle</span>
-          <span class="pill data-pill" id="dataFile">Data: no run yet</span>
-        </div>
-      </div>
-      <nav class="tabs">
-        <button class="tab active" data-tab="run">Run bot</button>
-        <button class="tab" data-tab="overview">Overview</button>
-        <button class="tab" data-tab="trades">Trades</button>
-        <button class="tab" data-tab="live">Live</button>
-      </nav>
-    </div>
-  </header>
-  <main>
-    <section id="run">
-      <div class="grid run-grid">
-        <div class="panel control-panel">
-          <h2>Bot controls</h2>
-          <form id="runForm">
-            <div class="form-grid">
-              <div class="section-title">Market source</div>
-              <label class="wide">Polymarket URL or slug
-                <input id="url" name="url" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required>
-              </label>
-              <label>Consecutive markets
-                <input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="6">
-              </label>
-              <label>Scan interval seconds
-                <input id="poll" name="poll" type="number" min="1" max="60" step="1" value="2">
-              </label>
-              <label>Size paper USD
-                <input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1">
-              </label>
-              <label>Run seconds override
-                <input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Auto">
-              </label>
-
-              <div class="section-title">Entry/exit strategy</div>
-              <label>Entry min
-                <input id="entry_min" name="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65">
-              </label>
-              <label>Entry max
-                <input id="entry_max" name="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68">
-              </label>
-              <label>Take profit
-                <input id="take_profit" name="take_profit" type="number" min="0.01" max="0.99" step="0.01" value="0.88">
-              </label>
-              <label>Stop loss
-                <input id="stop_loss" name="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58">
-              </label>
-              <label>Late exit seconds
-                <input id="late_seconds" name="late_seconds" type="number" min="0" max="300" step="1" value="30">
-              </label>
-              <label>Minimum BTC distance
-                <input id="min_distance_usd" name="min_distance_usd" type="number" min="0" step="1" value="100">
-              </label>
-              <label>Only enter when <= seconds left
-                <input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="120">
-              </label>
-
-              <div class="section-title">Risk filters</div>
-              <label>Max trades per label
-                <input id="max_trades_per_label_per_market" name="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1">
-              </label>
-              <label>No entry after seconds
-                <input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="0">
-              </label>
-              <label>Max total ask
-                <input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03">
-              </label>
-              <input type="hidden" name="market_lock_after_loss" value="false">
-              <label class="checkline">
-                <input id="market_lock_after_loss" name="market_lock_after_loss" type="checkbox" value="true" checked>
-                <span>Lock market after losing trade</span>
-              </label>
-
-              <div class="section-title">Infrastructure</div>
-              <label>Buffer arb
-                <input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.01">
-              </label>
-              <label>Fee buffer
-                <input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07">
-              </label>
-              <label>Seconds between markets
-                <input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300">
-              </label>
-              <label>Market lookup timeout
-                <input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60">
-              </label>
-              <label>End buffer seconds
-                <input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1">
-              </label>
-            </div>
-            <div class="command-row">
-              <button class="primary" id="startBtn" type="submit">Run bot</button>
-              <button id="stopBtn" type="button">Stop bot</button>
-              <button class="danger" id="resetBtn" type="button">Clear data</button>
-              <button id="closeAppBtn" type="button">Close app</button>
-            </div>
-            <div class="notice" id="controlNotice">Ready.</div>
-          </form>
-        </div>
-        <div class="panel terminal-panel">
-          <div class="row" style="justify-content:space-between;margin-bottom:12px">
-            <h2 style="margin:0">Log</h2>
-            <span class="pill" id="pidPill">Not running</span>
-          </div>
-          <pre class="terminal" id="terminal">Waiting for bot logs...</pre>
-        </div>
-      </div>
-    </section>
-    <section id="overview" class="hidden">
-      <div class="grid metrics" id="metrics"></div>
-      <div class="panel" style="margin-top:12px">
-        <div class="row" style="justify-content:space-between;margin-bottom:12px">
-          <h2 style="margin:0">Open Positions</h2>
-          <span class="pill" id="activeOverviewCount">0 positions</span>
-        </div>
-        <div class="table-scroll"><table id="activeOverview"></table></div>
-      </div>
-      <div class="grid two" style="margin-top:12px">
-        <div class="panel">
-          <h2>Equity curve</h2>
-          <svg id="equity" class="chart" role="img" aria-label="Cumulative paper PnL"></svg>
-        </div>
-        <div class="panel risk">
-          <h2>Strategy Health</h2>
-          <div id="health"></div>
-        </div>
-      </div>
-      <div class="grid two" style="margin-top:12px">
-        <div class="panel">
-          <h2>By Market</h2>
-          <div class="table-scroll"><table id="markets"></table></div>
-        </div>
-        <div class="panel">
-          <h2>By Outcome</h2>
-          <div class="table-scroll"><table id="outcomes"></table></div>
-        </div>
-      </div>
-    </section>
-    <section id="trades" class="hidden">
-      <div class="panel">
-        <div class="row" style="justify-content:space-between;margin-bottom:12px">
-          <h2 style="margin:0">Trade journal</h2>
-          <div class="row">
-            <input id="filter" placeholder="Filter market, outcome, reason">
-            <select id="resultFilter">
-              <option value="all">All trades</option>
-              <option value="wins">Winning trades</option>
-              <option value="losses">Losing trades</option>
-            </select>
-          </div>
-        </div>
-        <div class="table-scroll"><table id="tradesTable"></table></div>
-      </div>
-    </section>
-    <section id="live" class="hidden">
-      <div class="panel" style="margin-bottom:12px">
-        <h2>Open Positions</h2>
-        <div class="table-scroll"><table id="activePositions"></table></div>
-      </div>
-      <div class="grid two">
-        <div class="panel">
-          <h2>Latest order book snapshot</h2>
-          <div class="table-scroll"><table id="snapshots"></table></div>
-        </div>
-        <div class="panel">
-          <h2>Arbitrage events</h2>
-          <div id="arbSummary"></div>
-          <div class="table-scroll" style="margin-top:12px"><table id="arbEvents"></table></div>
-        </div>
-      </div>
-    </section>
-  </main>
-  <script>
-    let state = null;
-    let bot = null;
-    let formDirty = false;
-    let formHydrated = false;
-    const fmt = (n, d=4) => Number(n || 0).toFixed(d);
-    const cls = n => Number(n || 0) >= 0 ? 'pos' : 'neg';
-    const money = n => `<span class="${cls(n)}">${Number(n || 0) >= 0 ? '+' : ''}${fmt(n)}</span>`;
-    const pct = n => `${Number(n || 0).toFixed(1)}%`;
-    const valueMaybe = (n, d=2) => n === null || n === undefined ? '<span class="subtle">n/a</span>' : fmt(n, d);
-    const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    function activePositionCell(r) {
-      return `<div class="stacked">
-        <strong>${esc(r.market_slug || 'n/a')} ${esc(r.outcome || '')}</strong>
-        <span class="subtle">Cost ${valueMaybe(r.size_usd,2)} | Shares ${valueMaybe(r.shares,4)} | Entry ${valueMaybe(r.entry_price,2)}</span>
-        <span class="subtle">Held ${Number(r.hold_seconds || 0)}s</span>
-      </div>`;
-    }
-    function activePriceCell(r) {
-      return `<div class="stacked">
-        <strong>${valueMaybe(r.bid,2)}</strong>
-        <span class="subtle">Ask ${valueMaybe(r.ask,2)}</span>
-      </div>`;
-    }
-    function activePnlCell(r) {
-      if (r.unrealized_pnl === null || r.unrealized_pnl === undefined) return '<span class="subtle">n/a</span>';
-      const klass = cls(r.unrealized_pnl);
-      const roi = r.unrealized_roi === null || r.unrealized_roi === undefined ? 'n/a' : pct(r.unrealized_roi);
-      return `<span class="pnl-pair ${klass}"><span>${Number(r.unrealized_pnl) >= 0 ? '+' : ''}${fmt(r.unrealized_pnl)}</span><span>${roi}</span></span>`;
-    }
-    function setTab(name) {
-      document.querySelectorAll('main > section').forEach(el => el.classList.toggle('hidden', el.id !== name));
-      document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
-    }
-    document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => setTab(btn.dataset.tab)));
-    document.getElementById('runForm').addEventListener('input', () => {
-      if (!bot?.running) formDirty = true;
-    });
-    document.getElementById('runForm').addEventListener('change', () => {
-      if (!bot?.running) formDirty = true;
-    });
-    function table(id, headers, rows, empty='No data') {
-      const el = document.getElementById(id);
-      if (!rows.length) { el.innerHTML = `<tr><td class="empty">${empty}</td></tr>`; return; }
-      el.innerHTML = `<thead><tr>${headers.map(h => `<th>${h[0]}</th>`).join('')}</tr></thead><tbody>` +
-        rows.map(row => `<tr>${headers.map(h => `<td>${h[1](row)}</td>`).join('')}</tr>`).join('') + '</tbody>';
-    }
-    function drawEquity(rows) {
-      const svg = document.getElementById('equity');
-      const w = svg.clientWidth || 800, h = svg.clientHeight || 260, p = 24;
-      if (!rows.length) { svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="#91a09b">No closed paper trades yet</text>`; return; }
-      const ys = rows.map(r => Number(r.cumulative));
-      const minY = Math.min(0, ...ys), maxY = Math.max(0, ...ys);
-      const span = Math.max(.0001, maxY - minY);
-      const x = i => p + (rows.length === 1 ? 0 : i * (w - p * 2) / (rows.length - 1));
-      const y = v => h - p - ((v - minY) / span) * (h - p * 2);
-      const pts = rows.map((r, i) => `${x(i)},${y(Number(r.cumulative))}`).join(' ');
-      const zero = y(0);
-      svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-      svg.innerHTML = `<line x1="${p}" x2="${w-p}" y1="${zero}" y2="${zero}" stroke="#2a3633"/>` +
-        `<polyline points="${pts}" fill="none" stroke="#1aa896" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>` +
-        rows.map((r,i) => `<circle cx="${x(i)}" cy="${y(Number(r.cumulative))}" r="4" fill="${Number(r.pnl) >= 0 ? '#49d18f' : '#ff6b6b'}"><title>${r.market_slug}: ${fmt(r.cumulative)}</title></circle>`).join('');
-    }
-    function logClass(line) {
-      if (/stderr|fetch\/error|HTTP Error|Traceback|Error:/i.test(line)) return 'log-error';
-      if (/Market target price:/i.test(line)) return 'log-target';
-      if (/PAPER ENTER| ENTER /.test(line)) return 'log-enter';
-      if (/PAPER EXIT| EXIT /.test(line)) return 'log-exit';
-      if (/ARB /.test(line)) return 'log-arb';
-      if (/ HOLD /.test(line)) return 'log-hold';
-      if (/ WATCH |watch bid=|tick complete/.test(line)) return 'log-watch';
-      if (/started|Slug:|Market end:|Watcher end:|Outcomes:|Strategies:|No wallet/.test(line)) return 'log-start';
-      if (/ended|Paper trades|Arb events|No paper trades|No arb events|summary/i.test(line)) return 'log-end';
-      if (/^\s*$/.test(line)) return 'log-muted';
-      return 'log-line';
-    }
-    function colorizeLogLine(line) {
-      const safe = esc(line).replace(/^(\[[^\]]+\])/, '<span class="log-time">$1</span>');
-      return `<span class="log-line ${logClass(line)}">${safe}</span>`;
-    }
-    function renderTerminal(stdoutLines, stderrLines) {
-      const lines = [];
-      for (const line of stdoutLines || []) lines.push(line);
-      if ((stderrLines || []).length) {
-        if (lines.length) lines.push('');
-        lines.push('[stderr]');
-        for (const line of stderrLines) lines.push(line);
-      }
-      const terminal = document.getElementById('terminal');
-      if (!lines.length) {
-        terminal.textContent = 'Waiting for bot logs...';
-        return;
-      }
-      terminal.innerHTML = lines.map(colorizeLogLine).join('\n');
-      requestAnimationFrame(() => {
-        terminal.scrollTop = terminal.scrollHeight;
-      });
-    }
-    function formPayload() {
-      const form = new FormData(document.getElementById('runForm'));
-      const payload = {};
-      for (const [key, value] of form.entries()) payload[key] = String(value).trim();
-      for (const key of ['seconds']) if (!payload[key]) delete payload[key];
-      return payload;
-    }
-    function formFieldIsFocused() {
-      const active = document.activeElement;
-      return Boolean(active && document.getElementById('runForm').contains(active) && ['INPUT', 'SELECT'].includes(active.tagName));
-    }
-    function syncFormConfig(config) {
-      for (const [key, value] of Object.entries(config)) {
-        const input = document.getElementById(key);
-        if (input && value !== null && value !== undefined) {
-          if (input.type === 'checkbox') input.checked = Boolean(value);
-          else input.value = value;
-        }
-      }
-      formHydrated = true;
-    }
-    async function postJSON(url, payload={}) {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
-      return data;
-    }
-    function renderBotStatus(data, options={}) {
-      bot = data;
-      document.getElementById('botDot').classList.toggle('on', Boolean(data.running));
-      document.getElementById('botStatus').textContent = data.running
-        ? `Running PID ${data.pid} since ${data.started_at || 'now'}`
-        : (data.returncode === null ? 'Bot idle' : `Bot stopped, code ${data.returncode}`);
-      document.getElementById('pidPill').textContent = data.running ? `PID ${data.pid}` : 'Not running';
-      document.getElementById('dataFile').textContent = data.data_file ? `Data: ${data.data_file}` : 'Data: no run yet';
-      document.getElementById('dataFile').title = data.db_path || '';
-      document.getElementById('startBtn').disabled = Boolean(data.running);
-      document.getElementById('stopBtn').disabled = !data.running;
-      document.getElementById('resetBtn').disabled = Boolean(data.running);
-      document.querySelectorAll('#runForm input, #runForm select').forEach(input => {
-        input.disabled = Boolean(data.running);
-      });
-      const hasConfig = Boolean(data.config && data.config.url);
-      const shouldSyncForm = hasConfig && (
-        options.forceFormSync ||
-        data.running ||
-        !formHydrated ||
-        !formDirty
-      ) && (options.forceFormSync || !formFieldIsFocused());
-      if (shouldSyncForm) {
-        syncFormConfig(data.config);
-      }
-      renderTerminal(data.stdout_tail || [], data.stderr_tail || []);
-    }
-    async function refreshBot() {
-      const res = await fetch('/api/bot/status', { cache: 'no-store' });
-      renderBotStatus(await res.json());
-    }
-    async function runCommand(action) {
-      const notice = document.getElementById('controlNotice');
-      try {
-        if (action === 'start') {
-          notice.textContent = 'Starting bot...';
-          const status = await postJSON('/api/bot/start', formPayload());
-          formDirty = false;
-          renderBotStatus(status, {forceFormSync: true});
-          await refresh();
-          notice.textContent = 'Bot started.';
-        } else if (action === 'stop') {
-          notice.textContent = 'Stopping bot...';
-          renderBotStatus(await postJSON('/api/bot/stop'), {forceFormSync: true});
-          await refresh();
-          notice.textContent = 'Bot stopped.';
-        } else if (action === 'reset') {
-          notice.textContent = 'Clearing local data...';
-          renderBotStatus(await postJSON('/api/data/reset'));
-          await refresh();
-          notice.textContent = 'Local data cleared.';
-        } else if (action === 'close') {
-          notice.textContent = 'Closing app and stopping bot...';
-          await postJSON('/api/app/shutdown');
-          notice.textContent = 'App closed. You can close this browser tab.';
-          setTimeout(() => window.close(), 300);
-        }
-      } catch (error) {
-        notice.textContent = error.message;
-      }
-    }
-    function render(data) {
-      state = data;
-      document.getElementById('generated').textContent = `Updated ${data.generated_at}`;
-      const o = data.overall;
-      document.getElementById('metrics').innerHTML = [
-        ['Trades', o.trades],
-        ['PnL paper', money(o.pnl)],
-        ['Win rate', pct(o.win_rate)],
-        ['ROI on size', pct(o.roi)],
-        ['Markets tested', o.markets],
-        ['Average PnL', money(o.avg_pnl)],
-        ['Best trade', money(o.best)],
-        ['Worst trade', money(o.worst)]
-      ].map(m => `<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');
-      const activeRows = data.active_positions || [];
-      document.getElementById('activeOverviewCount').textContent = `${activeRows.length} positions`;
-      table('activeOverview', [
-        ['Cost / Shares / Entry', activePositionCell],
-        ['Current price', activePriceCell],
-        ['PnL / %PnL', activePnlCell]
-      ], activeRows, 'No open positions');
-      drawEquity(data.equity);
-      document.getElementById('health').innerHTML = `
-        <p><span class="pill">Stop loss</span> ${data.health.stop_loss_count}</p>
-        <p><span class="pill">Largest loss</span> ${money(data.health.largest_loss)}</p>
-        <p><span class="pill">Top 3 PnL share</span> ${pct(data.health.top_3_share)}</p>
-        <p class="subtle">If most profit comes from a few trades, keep collecting data before increasing size.</p>`;
-      table('markets', [['Market', r=>r.market_slug], ['Trades', r=>r.trades], ['PnL', r=>money(r.pnl)], ['Win', r=>pct(r.win_rate)], ['Worst', r=>money(r.worst)]], data.markets);
-      table('outcomes', [['Outcome', r=>r.outcome], ['Trades', r=>r.trades], ['PnL', r=>money(r.pnl)], ['Win', r=>pct(r.win_rate)], ['Avg entry', r=>fmt(r.avg_entry,2)], ['Avg exit', r=>fmt(r.avg_exit,2)], ['Risk exits', r=>r.risk_exits]], data.outcomes);
-      renderTrades();
-      table('activePositions', [
-        ['Cost / Shares / Entry', activePositionCell],
-        ['Current price', activePriceCell],
-        ['PnL / %PnL', activePnlCell]
-      ], activeRows, 'No open positions');
-      table('snapshots', [['Time', r=>r.time], ['Label', r=>r.label], ['Bid', r=>fmt(r.bid,2)], ['Ask', r=>fmt(r.ask,2)], ['Bid size', r=>fmt(r.bid_size,2)], ['Ask size', r=>fmt(r.ask_size,2)]], data.snapshots);
-      document.getElementById('arbSummary').innerHTML = data.arb.length ? data.arb.map(r => `<p><span class="pill">${r.kind}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join('') : '<p class="empty">No arb events yet.</p>';
-      table('arbEvents', [['Time', r=>r.time], ['Market', r=>r.market_slug], ['Type', r=>r.kind], ['Up/Yes', r=>fmt(r.yes_price,2)], ['Down/No', r=>fmt(r.no_price,2)], ['Edge', r=>money(r.edge)]], data.arb_events);
-    }
-    function renderTrades() {
-      if (!state) return;
-      const q = document.getElementById('filter').value.toLowerCase();
-      const mode = document.getElementById('resultFilter').value;
-      const rows = state.trades.filter(r => {
-        const hay = `${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason}`.toLowerCase();
-        if (q && !hay.includes(q)) return false;
-        if (mode === 'wins' && Number(r.pnl) <= 0) return false;
-        if (mode === 'losses' && Number(r.pnl) >= 0) return false;
-        return true;
-      });
-      table('tradesTable', [
-        ['Market', r=>r.market_slug], ['Outcome', r=>r.outcome], ['Opened', r=>r.entry_time], ['Closed', r=>r.exit_time],
-        ['Held', r=>`${r.hold_seconds}s`], ['Entry price', r=>fmt(r.entry_price,2)], ['Exit price', r=>fmt(r.exit_price,2)],
-        ['PnL', r=>money(r.pnl)], ['Exit reason', r=>r.exit_reason]
-      ], rows);
-    }
-    document.getElementById('filter').addEventListener('input', renderTrades);
-    document.getElementById('resultFilter').addEventListener('change', renderTrades);
-    document.getElementById('runForm').addEventListener('submit', event => {
-      event.preventDefault();
-      runCommand('start');
-    });
-    document.getElementById('stopBtn').addEventListener('click', () => runCommand('stop'));
-    document.getElementById('resetBtn').addEventListener('click', () => runCommand('reset'));
-    document.getElementById('closeAppBtn').addEventListener('click', () => runCommand('close'));
-    async function refresh() {
-      const res = await fetch('/api/dashboard', { cache: 'no-store' });
-      render(await res.json());
-    }
-    refresh();
-    refreshBot();
-    setInterval(refresh, 2000);
-    setInterval(refreshBot, 2000);
-  </script>
-</body>
-</html>"""
-
-
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="vi">
 <head>
@@ -5291,51 +4963,59 @@ DASHBOARD_HTML = r"""<!doctype html>
     .panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
     .metric .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.metric .value{margin-top:7px;font-size:22px;font-weight:780}
     .setup-grid{display:grid;grid-template-columns:minmax(280px,2fr) repeat(4,minmax(110px,1fr));gap:10px}
-    .risk-grid{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-top:12px}
+    .risk-grid{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px;margin-top:12px}
     .checkline{display:flex;align-items:center;gap:8px;min-height:34px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#0e1413;color:var(--ink)}
     .checkline input{width:16px;min-height:16px;accent-color:var(--accent)}
     .preset-board{display:grid;gap:10px;margin-top:12px}.preset-row{display:grid;grid-template-columns:96px repeat(9,minmax(58px,1fr)) minmax(100px,.9fr);gap:8px;align-items:end;border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0e1413}
     .preset-row[data-preset=safe]{border-left-color:var(--good)}.preset-row[data-preset=balanced]{border-left-color:var(--warn)}.preset-row[data-preset=aggressive]{border-left-color:var(--bad)}
     .preset-title{display:grid;gap:6px;align-self:center}.preset-title label{display:flex;align-items:center;gap:8px;color:var(--ink)}.preset-title input{width:16px;min-height:16px;accent-color:var(--accent)}
+    .preset-remove{min-height:28px;padding:4px 8px;border-color:rgba(239,115,95,.55);color:var(--bad);font-size:11px}
     .rr-box{display:grid;gap:3px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#101815}.rr-box strong{font-size:15px}.rr-box.good strong{color:var(--good)}.rr-box.thin strong{color:var(--warn)}.rr-box.bad strong{color:var(--bad)}
     .notice{margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:var(--radius);background:#101815;color:var(--ink);font-size:13px}
-    .terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto;max-height:100vh;overflow:hidden}
-    .terminal{flex:1;min-height:0;overflow:auto;overflow-wrap:anywhere;scrollbar-width:none;-ms-overflow-style:none;margin:0;padding:12px;border:1px solid #26322f;border-radius:var(--radius);background:var(--terminal);color:#c8d6d1;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;white-space:pre-wrap}
-    .terminal::-webkit-scrollbar{display:none;width:0;height:0}
-    .terminal.small{height:330px;flex:none}.terminal .log-line{display:block;min-height:18px}.terminal .log-time{color:#708079}.terminal .log-start{color:var(--accent);font-weight:700}.terminal .log-target{color:#ffd84d;font-weight:800}.terminal .log-watch{color:#aab7b2}.terminal .log-enter{color:var(--good);font-weight:700}.terminal .log-exit{color:var(--info);font-weight:700}.terminal .log-arb{color:var(--warn);font-weight:700}.terminal .log-hold{color:#8ec7ff}.terminal .log-end{color:#d8c27a}.terminal .log-error{color:var(--bad);font-weight:700}.terminal .log-muted{color:#73827d}
+    .terminal-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}
+    .terminal-stack{display:grid;gap:10px;min-height:0}.terminal-block{display:grid;gap:6px;min-width:0}.terminal-title{display:flex;align-items:center;justify-content:space-between;color:var(--muted);font-size:11px;font-weight:760;text-transform:uppercase;letter-spacing:.04em}
+    .terminal{overflow:auto;overflow-wrap:anywhere;margin:0;padding:12px;border:1px solid #26322f;border-radius:var(--radius);background:var(--terminal);color:#c8d6d1;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;white-space:pre-wrap}
+    .terminal.info{height:360px}.terminal.error{height:220px;border-color:rgba(239,115,95,.38)}.terminal .log-line{display:block;min-height:18px}.terminal .log-time{color:#708079}.terminal .log-start{color:var(--accent);font-weight:700}.terminal .log-target{color:#ffd84d;font-weight:800}.terminal .log-watch{color:#aab7b2}.terminal .log-enter{color:var(--good);font-weight:700}.terminal .log-exit{color:var(--info);font-weight:700}.terminal .log-arb{color:var(--warn);font-weight:700}.terminal .log-hold{color:#8ec7ff}.terminal .log-end{color:#d8c27a}.terminal .log-error{color:var(--bad);font-weight:700}.terminal .log-muted{color:#73827d}
     .hidden{display:none}table{width:100%;border-collapse:collapse;font-size:12.5px}th,td{text-align:left;border-bottom:1px solid var(--border);padding:9px 8px;vertical-align:top}th{position:sticky;top:0;background:#101614;color:var(--muted);font-weight:720;z-index:1}
-    .table-scroll{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius)}.chart{width:100%;height:280px;display:block;border:1px solid var(--border);border-radius:var(--radius);background:#0d1211}
+    .table-scroll{max-height:520px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius)}.trade-journal-scroll{max-height:calc(100dvh - 220px);min-height:360px}.journal-tabs{display:flex;gap:6px;align-items:center}.journal-tab{min-height:32px;padding:6px 10px;color:var(--muted)}.journal-tab.active{background:var(--accent);border-color:var(--accent);color:#04110f}.chart{width:100%;height:280px;display:block;border:1px solid var(--border);border-radius:var(--radius);background:#0d1211}
     .stacked{display:grid;gap:3px;min-width:0}.stacked strong{font-weight:760;color:var(--ink)}.pos{color:var(--good)}.neg{color:var(--bad)}.empty{color:var(--muted);padding:24px;text-align:center}
     .market-reference{display:grid;grid-template-columns:minmax(120px,.8fr) minmax(170px,1fr) auto;gap:18px;align-items:end;margin:-2px 0 14px;padding:0 2px}.reference-stat{min-width:0}.reference-target{padding-right:18px;border-right:1px solid var(--line)}.reference-countdown{justify-self:end;text-align:right}.reference-label{display:block;color:#66727c;font-size:11px;font-weight:760;line-height:1.2}.reference-label-row{display:flex;align-items:center;gap:8px;min-width:0}.reference-current .reference-label{color:#f0a000}.reference-value{display:block;margin-top:5px;font-size:24px;line-height:1.05;font-weight:780;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reference-target .reference-value{color:#8c98a4}.reference-current .reference-value{color:#f7931a}.reference-distance-inline{font-size:11px;font-weight:780;white-space:nowrap}.reference-distance-inline.up{color:var(--good)}.reference-distance-inline.down{color:var(--bad)}.reference-time{display:block;margin-top:4px;color:#66756f;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.countdown-pair{display:flex;gap:12px;align-items:flex-end;justify-content:flex-end}.countdown-pair strong{display:block;color:#ff4f62;font-size:24px;line-height:1.05;font-weight:820}.countdown-pair small{display:block;margin-top:3px;color:#77828c;font-size:9px;font-weight:760;text-transform:uppercase}
     .manual-overview{grid-template-columns:340px minmax(0,1fr)}.manual-ticket{background:#11171b;border:1px solid #253039;border-radius:12px;padding:14px 16px;min-height:416px;box-shadow:inset 0 1px 0 rgba(255,255,255,.035)}.manual-head{display:flex;gap:12px;align-items:center;margin-bottom:18px}.btc-icon{display:block;width:48px;height:48px;flex:0 0 48px;border-radius:7px;overflow:hidden}.manual-market{color:#8b99a6;font-size:14px;font-weight:730;line-height:1.2}.manual-market-time{margin-top:2px;color:#71808b;font-size:12px;font-weight:650;line-height:1.2;white-space:nowrap}.manual-selected{margin-top:3px;color:var(--good);font-size:16px;font-weight:780}.manual-wallet{margin:-4px 0 16px;padding:10px;border:1px solid #24303a;border-radius:8px;background:#0e151a}.manual-budget-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:end}.manual-budget-row label{display:grid;gap:4px;color:#7d8995;font-size:11px;font-weight:760;text-transform:uppercase}.manual-budget-row input{min-height:32px;padding:6px 8px;border-radius:7px}.manual-budget-row button{min-height:32px;padding:0 10px;border-radius:7px}.manual-wallet-metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.manual-wallet-metrics div{border-top:1px solid #1d2932;padding-top:8px}.manual-wallet-metrics span{display:block;color:#74838f;font-size:11px}.manual-wallet-metrics strong{display:block;margin-top:2px;color:#e8eff4;font-size:15px}.manual-mode{display:flex;align-items:center;gap:12px;margin-bottom:20px}.manual-mode button{min-height:28px;padding:0 0 8px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:#7d8995;font-size:15px;font-weight:790}.manual-mode button.active{border-bottom-color:#e6edf2;color:#e6edf2}.manual-outcome-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}.manual-choice{min-height:47px;border:0;border-radius:8px;background:#222c36;color:#9ba7b2;font-size:15px;font-weight:830}.manual-choice.active{background:#39a169;color:#eef7f1}.manual-section-title{font-size:16px;font-weight:800;color:#e8eff4;line-height:1.1}.manual-section-sub{margin-top:4px;color:#778692;font-size:12px}.manual-amount-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:18px 0 12px}.manual-percent-row{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:18px 0 12px}.manual-chip{min-height:55px;border-radius:12px;background:#10171d;border:1px solid #24303a;color:#d9e3ea}.manual-chip strong{display:block;font-size:20px}.manual-chip span{display:block;margin-top:2px;color:#7b8995;font-size:11px}.manual-chip.active,.manual-percent.active{border-color:#3a9167;background:#173126}.manual-percent{min-height:31px;padding:5px 8px;border:0;border-radius:8px;background:#222c36;color:#9eaab4;font-size:12px}.manual-shares{margin-top:12px;font-size:42px;line-height:1;font-weight:800;text-align:right;color:#8c9ba8}.manual-submit{width:100%;margin-top:10px;border:0;background:#168bd6;color:#eaf6ff}.manual-submit:hover:not(:disabled){background:#1b99e8;color:#fff}.manual-status{min-height:18px;margin-top:10px;color:#82909b;font-size:12px}.manual-ticket .hidden{display:none}
+    .manual-position-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:-6px 0 18px;padding:10px;border:1px solid #24303a;border-radius:8px;background:#0e151a}.manual-position-summary div{min-width:0;border-top:1px solid #1d2932;padding-top:8px}.manual-position-summary div:nth-child(-n+2){border-top:0;padding-top:0}.manual-position-summary span{display:block;color:#74838f;font-size:11px}.manual-position-summary strong{display:block;margin-top:3px;color:#e8eff4;font-size:15px;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.manual-position-summary strong .subtle{font-size:15px}
     .preset-chip{border-color:currentColor;background:transparent}.preset-chip.safe{color:var(--good)}.preset-chip.balanced{color:var(--warn)}.preset-chip.aggressive{color:var(--bad)}.preset-chip.manual{color:var(--info)}
     .decision-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.decision-card{border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius);padding:10px;background:#0f1514}.decision-card.safe{border-left-color:var(--good)}.decision-card.balanced{border-left-color:var(--warn)}.decision-card.aggressive{border-left-color:var(--bad)}
-    @media(max-width:1320px){main{min-height:auto}.run-grid,.two{grid-template-columns:1fr}.manual-ticket{max-width:none}.setup-grid,.risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preset-row{grid-template-columns:repeat(4,minmax(0,1fr))}.preset-title,.rr-box{grid-column:1/-1}.metrics,.decision-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.terminal-panel{min-height:620px}}
-    @media(max-width:760px){.wrap,main{width:calc(100% - 24px)}.setup-grid,.risk-grid,.metrics,.decision-grid,.market-reference,.overview-row,.trades-insight-row{grid-template-columns:1fr}.manual-ticket{max-width:none}.reference-target{padding-right:0;border-right:0}.reference-countdown{justify-self:start;text-align:left}.countdown-pair{justify-content:flex-start}.topbar{align-items:flex-start;flex-direction:column}.terminal-panel{min-height:520px}}
+    @media(max-width:1320px){main{min-height:auto}.run-grid,.two{grid-template-columns:1fr}.manual-ticket{max-width:none}.setup-grid,.risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.preset-row{grid-template-columns:repeat(4,minmax(0,1fr))}.preset-title,.rr-box{grid-column:1/-1}.metrics,.decision-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.terminal.info{height:300px}.terminal.error{height:180px}}
+    @media(max-width:760px){.wrap,main{width:calc(100% - 24px)}.setup-grid,.risk-grid,.metrics,.decision-grid,.market-reference,.overview-row,.trades-insight-row{grid-template-columns:1fr}.manual-ticket{max-width:none}.reference-target{padding-right:0;border-right:0}.reference-countdown{justify-self:start;text-align:left}.countdown-pair{justify-content:flex-start}.topbar{align-items:flex-start;flex-direction:column}.terminal.info{height:260px}.terminal.error{height:160px}.trade-journal-scroll{max-height:520px;min-height:280px}}
   </style>
 </head>
 <body>
   <header><div class="wrap"><div class="topbar"><div><h1>Polymarket Paper Console</h1><div class="subtle" id="generated">Loading paper data...</div></div><div class="statusline"><span class="dot" id="botDot"></span><span class="subtle" id="botStatus">Bot idle</span><span class="pill data-pill" id="dataFile">Data: no run yet</span></div></div><nav class="tabs"><button class="tab active" data-tab="run">Run bot</button><button class="tab" data-tab="overview">Overview</button><button class="tab" data-tab="trades">Trades</button><button class="tab" data-tab="live">Live</button></nav></div></header>
   <main>
-    <section id="run"><div class="grid run-grid"><form id="runForm" class="grid"><div class="panel"><h2>Run setup</h2><div class="setup-grid"><label>Polymarket URL or slug<input id="url" name="url" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required></label><label>Consecutive markets<input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="6"></label><label>Scan interval seconds<input id="poll" name="poll" type="number" min="1" max="60" step="1" value="2"></label><label>Size paper USD<input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1"></label><label>Run seconds override<input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Auto"></label></div><div class="risk-grid"><label>No entry after seconds<input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="0"></label><label>Max total ask<input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.03"></label><label>Only enter when <= seconds left<input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="120"></label><label>Buffer arb<input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.01"></label><label>Fee buffer<input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07"></label><label>Seconds between markets<input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300"></label><label>Market lookup timeout<input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60"></label><label>End buffer seconds<input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1"></label><input type="hidden" name="market_lock_after_loss" value="false"><label class="checkline"><input id="market_lock_after_loss" name="market_lock_after_loss" type="checkbox" value="true" checked><span>Lock market after losing trade</span></label></div></div>
-    <div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Preset strategy matrix</h2><span class="subtle">R:R updates live from entry / TP / SL</span></div><div class="preset-board" id="presetBoard">
-      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>Safe</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.84"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.60"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.04"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="100"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Balanced</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.86"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.65"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.72"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.56"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.08"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.06"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="30"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="75"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
-    </div><div class="command-row" style="margin-top:12px"><button class="primary" id="startBtn" type="submit">Run bot</button><button id="stopBtn" type="button">Stop bot</button><button class="danger" id="resetBtn" type="button">Clear data</button><button id="closeAppBtn" type="button">Close app</button></div><div class="notice" id="controlNotice">Ready.</div></div></form><div class="panel terminal-panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Log</h2><span class="pill" id="pidPill">Not running</span></div><pre class="terminal" id="terminal">Waiting for bot logs...</pre></div></div></section>
-    <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid manual-overview" style="margin-top:12px"><div class="manual-ticket" id="manualTicket"><div class="manual-head"><svg class="btc-icon" viewBox="0 0 96 96" role="img" aria-label="Bitcoin"><rect width="96" height="96" rx="9" fill="#f7931a"/><g transform="translate(48 48) rotate(-10) scale(.74) translate(-31.5 -43.5)"><path fill="#fff" d="M63.03 39.74c1.28-8.52-5.21-13.1-14.09-16.16l2.88-11.54-7.03-1.75-2.8 11.23c-1.85-.46-3.75-.9-5.62-1.32l2.82-11.31-7.03-1.75-2.88 11.54c-1.55-.35-3.06-.7-4.54-1.07l.01-.04-9.7-2.42-1.87 7.51s5.22 1.19 5.11 1.27c2.85.71 3.36 2.59 3.28 4.09l-3.28 13.15c.2.05.45.12.73.23l-.74-.18-4.6 18.42c-.35.86-1.23 2.16-3.22 1.67.07.1-5.11-1.28-5.11-1.28L0 67.2l9.15 2.28c1.7.43 3.37.88 5.01 1.3l-2.91 11.67 7.02 1.75 2.88-11.55c1.9.52 3.75.99 5.55 1.44l-2.87 11.49 7.03 1.75 2.91-11.65c11.99 2.27 21.01 1.35 24.81-9.49 3.06-8.73-.15-13.76-6.47-17.04 4.6-1.06 8.07-4.08 8.99-10.33zM46.92 62.29c-2.17 8.73-16.88 4.01-21.64 2.83l3.86-15.48c4.77 1.19 20.05 3.54 17.78 12.65zm2.18-22.67c-1.98 7.94-14.22 3.91-18.19 2.92l3.5-14.04c3.97.99 16.76 2.83 14.69 11.12z"/></g></svg><div><div class="manual-market" id="manualMarketTitle">BTC Up or Down 5m</div><div class="manual-market-time" id="manualMarketTime"></div><div class="manual-selected" id="manualSelectedLabel">Up</div></div></div><div class="manual-wallet"><div class="manual-budget-row"><label>Budget<input id="manualBudgetInput" type="number" min="0" step="0.01" value="100"></label><button id="manualBudgetSave" type="button">Save</button><button id="manualResetPnl" type="button">Reset PnL</button></div><div class="manual-wallet-metrics"><div><span>Available</span><strong id="manualBudgetAvailable">$100.00</strong></div><div><span>PnL</span><strong id="manualAccountPnl">+0.0000</strong></div></div></div><div class="manual-mode"><button type="button" data-manual-side="buy">Buy</button><button type="button" data-manual-side="sell">Sell</button></div><div class="manual-outcome-row"><button class="manual-choice" type="button" data-manual-outcome="Up">Up <span id="manualUpPrice">--</span></button><button class="manual-choice" type="button" data-manual-outcome="Down">Down <span id="manualDownPrice">--</span></button></div><div id="manualBuyPane"><div class="manual-section-title">One-tap buy</div><div class="manual-section-sub" id="manualCashLine">$1.00 paper</div><div class="manual-amount-row"><button class="manual-chip" type="button" data-manual-amount="1"><strong>$1</strong><span id="manualWin1">win --</span></button><button class="manual-chip" type="button" data-manual-amount="2"><strong>$2</strong><span id="manualWin2">win --</span></button><button class="manual-chip" type="button" data-manual-amount="5"><strong>$5</strong><span id="manualWin5">win --</span></button></div></div><div id="manualSellPane" class="hidden"><div class="manual-section-title">Shares</div><div class="manual-shares" id="manualShares">0</div><div class="manual-percent-row"><button class="manual-percent" type="button" data-manual-percent="25">25%</button><button class="manual-percent" type="button" data-manual-percent="50">50%</button><button class="manual-percent" type="button" data-manual-percent="75">75%</button><button class="manual-percent" type="button" data-manual-percent="100">Max</button></div></div><button class="manual-submit" id="manualSubmit" type="button">Buy Up</button><div class="manual-status" id="manualNotice">Waiting for live prices...</div></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Open Positions</h2><span class="pill" id="activeOverviewCount">0 positions</span></div><div class="market-reference" id="activeMarketReference"></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Strategy Health</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><h2>By Market</h2><div class="table-scroll"><table id="markets"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>By Outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div><div class="panel"><h2>Trade journal</h2><div class="table-scroll"><table id="overviewRecentTrades"></table></div></div></div></section>
-    <section id="trades" class="hidden"><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Trade journal</h2><div class="toolbar"><input id="filter" placeholder="Filter market, outcome, reason"><select id="presetFilter"><option value="all">All presets</option></select><select id="resultFilter"><option value="all">All trades</option><option value="wins">Winning trades</option><option value="losses">Losing trades</option></select></div></div><div class="table-scroll"><table id="tradesTable"></table></div></div></section>
-    <section id="live" class="hidden"><div class="grid two"><div class="panel"><h2>Preset decision board</h2><div class="decision-grid" id="decisionBoard"></div></div><div class="panel"><h2>Latest Order Book</h2><div class="table-scroll"><table id="snapshots"></table></div></div></div><div class="panel" style="margin-top:12px"><h2>Open Positions</h2><div class="table-scroll"><table id="activePositions"></table></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Terminal log</h2><pre class="terminal small" id="terminalLive">Waiting for bot logs...</pre></div><div class="panel"><h2>Arbitrage</h2><div id="arbSummary"></div><div class="table-scroll" style="margin-top:12px"><table id="arbEvents"></table></div></div></div></section>
+    <section id="run"><div class="grid run-grid"><form id="runForm" class="grid"><div class="panel"><h2>Run setup</h2><div class="setup-grid"><label>Polymarket URL or slug<input id="url" name="url" value="https://polymarket.com/event/btc-updown-5m-1779609900" placeholder="https://polymarket.com/event/btc-updown-5m-1779609900" required></label><label>Consecutive markets<input id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="30"></label><label>Size paper USD<input id="size_usd" name="size_usd" type="number" min="0.01" step="0.01" value="1"></label><label>Run seconds override<input id="seconds" name="seconds" type="number" min="1" step="1" placeholder="Auto"></label></div><div class="risk-grid"><label>No entry when &lt;= seconds left<input id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="15"></label><label>Max total ask<input id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.06"></label><label>Only enter when <= seconds left<input id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="260"></label><label>Buffer arb<input id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.02"></label><label>Fee buffer<input id="fee_rate" name="fee_rate" type="number" min="0" max="1" step="0.001" value="0.07"></label><label>Seconds between markets<input id="chain_interval_seconds" name="chain_interval_seconds" type="number" min="1" step="1" value="300"></label><label>Market lookup timeout<input id="lookup_timeout_seconds" name="lookup_timeout_seconds" type="number" min="1" step="1" value="60"></label><label>End buffer seconds<input id="end_buffer_seconds" name="end_buffer_seconds" type="number" min="0" step="1" value="1"></label><input id="market_lock_after_loss" type="hidden" name="market_lock_after_loss" value="true"><label>Loss lock scope<select id="loss_lock_scope" name="loss_lock_scope"><option value="preset" selected>Per preset</option><option value="market">Whole market</option><option value="none">Off</option></select></label></div></div>
+    <div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Preset strategy matrix</h2><div class="toolbar"><button id="presetAddBtn" type="button">Add variant</button><button id="presetSweepBtn" type="button">Distance sweep</button><span class="subtle">R:R updates live from entry / TP / SL</span></div></div><div class="preset-board" id="presetBoard">
+      <div class="preset-row" data-preset="safe"><div class="preset-title"><h3>Safe</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.62"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.88"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.54"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.07"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.05"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="50"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="25"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="balanced"><div class="preset-title"><h3>Balanced</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.66"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.74"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.90"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.58"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.08"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.06"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="50"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="25"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+      <div class="preset-row" data-preset="aggressive"><div class="preset-title"><h3>Aggressive</h3><label><input data-preset-field="enabled" type="checkbox" checked> Enabled</label></div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.74"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.82"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.96"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="0.68"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.10"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="0.07"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="40"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="20"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="1"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>
+    </div><div class="command-row" style="margin-top:12px"><button class="primary" id="startBtn" type="submit">Run bot</button><button id="stopBtn" type="button">Stop bot</button><button class="danger" id="resetBtn" type="button">Clear data</button><button id="closeAppBtn" type="button">Close app</button></div><div class="notice" id="controlNotice">Ready.</div></div></form><div class="panel terminal-panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Log</h2><span class="pill" id="pidPill">Not running</span></div><div class="terminal-stack"><div class="terminal-block"><div class="terminal-title">Bot output</div><pre class="terminal info" id="terminalInfo">Waiting for bot logs...</pre></div><div class="terminal-block"><div class="terminal-title">Error log</div><pre class="terminal error" id="terminalError">No error logs.</pre></div></div></div></div></section>
+    <section id="overview" class="hidden"><div class="grid metrics" id="metrics"></div><div class="grid manual-overview" style="margin-top:12px"><div class="manual-ticket" id="manualTicket"><div class="manual-head"><svg class="btc-icon" viewBox="0 0 96 96" role="img" aria-label="Bitcoin"><rect width="96" height="96" rx="9" fill="#f7931a"/><g transform="translate(48 48) rotate(-10) scale(.74) translate(-31.5 -43.5)"><path fill="#fff" d="M63.03 39.74c1.28-8.52-5.21-13.1-14.09-16.16l2.88-11.54-7.03-1.75-2.8 11.23c-1.85-.46-3.75-.9-5.62-1.32l2.82-11.31-7.03-1.75-2.88 11.54c-1.55-.35-3.06-.7-4.54-1.07l.01-.04-9.7-2.42-1.87 7.51s5.22 1.19 5.11 1.27c2.85.71 3.36 2.59 3.28 4.09l-3.28 13.15c.2.05.45.12.73.23l-.74-.18-4.6 18.42c-.35.86-1.23 2.16-3.22 1.67.07.1-5.11-1.28-5.11-1.28L0 67.2l9.15 2.28c1.7.43 3.37.88 5.01 1.3l-2.91 11.67 7.02 1.75 2.88-11.55c1.9.52 3.75.99 5.55 1.44l-2.87 11.49 7.03 1.75 2.91-11.65c11.99 2.27 21.01 1.35 24.81-9.49 3.06-8.73-.15-13.76-6.47-17.04 4.6-1.06 8.07-4.08 8.99-10.33zM46.92 62.29c-2.17 8.73-16.88 4.01-21.64 2.83l3.86-15.48c4.77 1.19 20.05 3.54 17.78 12.65zm2.18-22.67c-1.98 7.94-14.22 3.91-18.19 2.92l3.5-14.04c3.97.99 16.76 2.83 14.69 11.12z"/></g></svg><div><div class="manual-market" id="manualMarketTitle">BTC Up or Down 5m</div><div class="manual-market-time" id="manualMarketTime"></div><div class="manual-selected" id="manualSelectedLabel">Up</div></div></div><div class="manual-wallet"><div class="manual-budget-row"><label>Budget<input id="manualBudgetInput" type="number" min="0" step="0.01" value="100"></label><button id="manualBudgetSave" type="button">Save</button><button id="manualResetPnl" type="button">Reset PnL</button></div><div class="manual-wallet-metrics"><div><span>Available</span><strong id="manualBudgetAvailable">$100.00</strong></div><div><span>PnL</span><strong id="manualAccountPnl">+0.0000</strong></div></div></div><div class="manual-mode"><button type="button" data-manual-side="buy">Buy</button><button type="button" data-manual-side="sell">Sell</button></div><div class="manual-outcome-row"><button class="manual-choice" type="button" data-manual-outcome="Up">Up <span id="manualUpPrice">--</span></button><button class="manual-choice" type="button" data-manual-outcome="Down">Down <span id="manualDownPrice">--</span></button></div><div id="manualBuyPane"><div class="manual-section-title">One-tap buy</div><div class="manual-section-sub" id="manualCashLine">$1.00 paper</div><div class="manual-amount-row"><button class="manual-chip" type="button" data-manual-amount="1"><strong>$1</strong><span id="manualWin1">win --</span></button><button class="manual-chip" type="button" data-manual-amount="2"><strong>$2</strong><span id="manualWin2">win --</span></button><button class="manual-chip" type="button" data-manual-amount="5"><strong>$5</strong><span id="manualWin5">win --</span></button></div></div><div id="manualSellPane" class="hidden"><div class="manual-section-title">Shares</div><div class="manual-shares" id="manualShares">0</div><div class="manual-percent-row"><button class="manual-percent" type="button" data-manual-percent="25">25%</button><button class="manual-percent" type="button" data-manual-percent="50">50%</button><button class="manual-percent" type="button" data-manual-percent="75">75%</button><button class="manual-percent" type="button" data-manual-percent="100">Max</button></div></div><button class="manual-submit" id="manualSubmit" type="button">Buy Up</button><div class="manual-status" id="manualNotice">Waiting for live prices...</div></div><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Open Positions</h2><span class="pill" id="activeOverviewCount">0 positions</span></div><div class="market-reference" id="activeMarketReference"></div><div class="table-scroll"><table id="activeOverview"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Preset ranking</h2><div class="table-scroll"><table id="presetRanking"></table></div><h2 style="margin-top:14px">Preset performance</h2><div class="table-scroll"><table id="presetSummary"></table></div></div><div class="panel"><h2>Strategy Health</h2><div id="health"></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>Equity curve by preset</h2><svg id="equity" class="chart" role="img" aria-label="PnL paper by preset"></svg></div><div class="panel"><h2>By Market</h2><div class="table-scroll"><table id="markets"></table></div></div></div><div class="grid two" style="margin-top:12px"><div class="panel"><h2>By Outcome</h2><div class="table-scroll"><table id="outcomes"></table></div></div><div class="panel"><h2>Trade journal</h2><div class="table-scroll"><table id="overviewRecentTrades"></table></div></div></div></section>
+    <section id="trades" class="hidden"><div class="panel"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h2 style="margin:0">Trade journal</h2><div class="journal-tabs" role="tablist" aria-label="Trade journal type"><button class="journal-tab active" type="button" data-journal-mode="auto" role="tab" aria-selected="true">Auto bot</button><button class="journal-tab" type="button" data-journal-mode="manual" role="tab" aria-selected="false">Manual</button></div><div class="toolbar"><input id="filter" placeholder="Filter market, outcome, reason"><select id="presetFilter"><option value="all">All presets</option></select><select id="resultFilter"><option value="all">All trades</option><option value="wins">Winning trades</option><option value="losses">Losing trades</option></select></div></div><div class="table-scroll trade-journal-scroll"><table id="tradesTable"></table></div></div></section>
+    <section id="live" class="hidden"><div class="grid two"><div class="panel"><h2>Preset decision board</h2><div class="decision-grid" id="decisionBoard"></div></div><div class="panel"><h2>Latest Order Book</h2><div class="table-scroll"><table id="snapshots"></table></div></div></div><div class="panel" style="margin-top:12px"><h2>Open Positions</h2><div class="table-scroll"><table id="activePositions"></table></div></div><div class="panel" style="margin-top:12px"><h2>Arbitrage</h2><div id="arbSummary"></div><div class="table-scroll" style="margin-top:12px"><table id="arbEvents"></table></div></div></section>
   </main>
   <script>
-    let state=null,bot=null,formDirty=false,formHydrated=false;
+    let state=null,bot=null,formDirty=false,formHydrated=false,tradeJournalMode='auto';
     const presetNames={safe:'Safe',balanced:'Balanced',aggressive:'Aggressive',manual:'Manual',legacy:'Legacy'};
     const presetColors={safe:'#4fd18b',balanced:'#e7b84b',aggressive:'#ef735f',manual:'#7bb7ff',legacy:'#7bb7ff'};
+    const basePresetKeys=new Set(['safe','balanced','aggressive']);
     const fmt=(n,d=4)=>Number(n||0).toFixed(d),cls=n=>Number(n||0)>=0?'pos':'neg',money=n=>`<span class="${cls(n)}">${Number(n||0)>=0?'+':''}${fmt(n)}</span>`,pct=n=>`${Number(n||0).toFixed(1)}%`;
     const esc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])),valueMaybe=(n,d=2)=>n===null||n===undefined?'<span class="subtle">n/a</span>':fmt(n,d);
     function presetChip(row){const key=row.preset_key||row.key||'legacy';return `<span class="pill preset-chip ${esc(key)}">${esc(row.preset_name||presetNames[key]||key)}</span>`}
     function rrMetrics(p){const min=Number(p.entry_min),max=Number(p.entry_max),tp=Number(p.take_profit),sl=Number(p.stop_loss),mid=(min+max)/2;if(tp<=0)return{avg:NaN,worst:NaN,best:NaN,tpOff:true};const rr=entry=>entry>sl?(tp-entry)/(entry-sl):NaN;return{avg:rr(mid),worst:rr(max),best:rr(min),tpOff:false}}
     function rrClass(worst){if(!Number.isFinite(worst)||worst<1)return'bad';if(worst<1.5)return'thin';return'good'}
+    function uniquePresetKey(base){const keys=new Set([...document.querySelectorAll('.preset-row')].map(row=>row.dataset.preset)),slug=String(base||'preset').toLowerCase().replace(/[^a-z0-9_-]+/g,'_').replace(/^_+|_+$/g,'')||'preset';let key=slug,index=2;while(keys.has(key))key=`${slug}_${index++}`;return key}
+    function presetRowHtml(p){const remove=!basePresetKeys.has(p.key)?'<button class="preset-remove" type="button" data-preset-remove>Remove</button>':'';return`<div class="preset-row" data-preset="${esc(p.key)}"><div class="preset-title"><h3>${esc(p.name||p.key)}</h3><label><input data-preset-field="enabled" type="checkbox" ${p.enabled===false?'':'checked'}> Enabled</label>${remove}</div><label>Entry min<input data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="${esc(p.entry_min??0.62)}"></label><label>Entry max<input data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="${esc(p.entry_max??0.70)}"></label><label>TP<input data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="${esc(p.take_profit??0.88)}"></label><label>SL<input data-preset-field="stop_loss" type="number" min="0.01" max="0.99" step="0.01" value="${esc(p.stop_loss??0.54)}"></label><label>Trail start<input data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="${esc(p.trail_start??0.07)}"></label><label>Trail dist<input data-preset-field="trail_distance" type="number" min="0" max="0.99" step="0.01" value="${esc(p.trail_distance??0.05)}"></label><label>Late s<input data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="${esc(p.late_seconds??50)}"></label><label>BTC dist<input data-preset-field="min_distance_usd" type="number" min="0" step="1" value="${esc(p.min_distance_usd??25)}"></label><label>Max trades<input data-preset-field="max_trades_per_label_per_market" type="number" min="0" max="100" step="1" value="${esc(p.max_trades_per_label_per_market??1)}"></label><div class="rr-box" data-rr-box><strong>0.00R</strong><span class="subtle">Worst 0.00R / Best 0.00R</span></div></div>`}
+    function addPresetRow(seed={}){const rows=collectPresets(),source=rows.find(row=>row.enabled)||rows.at(-1)||{key:'custom',name:'Custom',entry_min:0.66,entry_max:0.74,take_profit:0.9,stop_loss:0.58,trail_start:0.08,trail_distance:0.06,late_seconds:50,min_distance_usd:25,max_trades_per_label_per_market:1},key=uniquePresetKey(seed.key||`${source.key}_v`),preset={...source,...seed,key,name:seed.name||`${source.name||source.key} variant`,enabled:seed.enabled??true};document.getElementById('presetBoard').insertAdjacentHTML('beforeend',presetRowHtml(preset));formDirty=true;updatePresetRisk();renderPresetFilter()}
+    function addDistanceSweep(){const presets=collectPresets(),bases=presets.filter(row=>row.enabled),selected=bases.length?bases:presets.slice(0,1);for(const base of selected)[25,30,35].forEach(dist=>addPresetRow({...base,key:`${base.key}_d${dist}`,name:`${base.name} D${dist}`,min_distance_usd:dist}))}
+    function removePresetRow(button){if(bot?.running)return;const row=button.closest('.preset-row'),key=row?.dataset.preset;if(!row||basePresetKeys.has(key))return;row.remove();formDirty=true;updatePresetRisk();renderPresetFilter();renderDecisionBoard(state||{})}
     function collectPresets(){return[...document.querySelectorAll('.preset-row')].map(row=>{const key=row.dataset.preset,get=field=>row.querySelector(`[data-preset-field="${field}"]`);let trailStart=get('trail_start').value,trailDistance=get('trail_distance').value;if(Number(trailStart)<=0||Number(trailDistance)<=0){trailStart='0';trailDistance='0'}return{key,name:row.querySelector('h3').textContent.trim(),enabled:get('enabled').checked,entry_min:get('entry_min').value,entry_max:get('entry_max').value,take_profit:get('take_profit').value,stop_loss:get('stop_loss').value,trail_start:trailStart,trail_distance:trailDistance,late_seconds:get('late_seconds').value,min_distance_usd:get('min_distance_usd').value,max_trades_per_label_per_market:get('max_trades_per_label_per_market').value}})}
     function updatePresetRisk(){for(const row of document.querySelectorAll('.preset-row')){const preset=collectPresets().find(item=>item.key===row.dataset.preset),rr=rrMetrics(preset),box=row.querySelector('[data-rr-box]');box.className=`rr-box ${rr.tpOff?'thin':rrClass(rr.worst)}`;box.innerHTML=rr.tpOff?'<strong>TP off</strong><span class="subtle">Trailing / SL manages exits</span>':`<strong>${Number.isFinite(rr.avg)?rr.avg.toFixed(2)+'R':'Invalid'}</strong><span class="subtle">Worst ${Number.isFinite(rr.worst)?rr.worst.toFixed(2)+'R':'Invalid'} / Best ${Number.isFinite(rr.best)?rr.best.toFixed(2)+'R':'Invalid'}</span>`}}
     function activePositionCell(r){return`<div class="stacked"><strong>${presetChip(r)} ${esc(r.market_slug||'n/a')} ${esc(r.outcome||'')}</strong><span class="subtle">Size ${valueMaybe(r.size_usd,2)} | Shares ${valueMaybe(r.shares,4)} | Entry ${valueMaybe(r.entry_price,2)}</span><span class="subtle">Held ${Number(r.hold_seconds||0)}s</span></div>`}
@@ -5346,43 +5026,87 @@ DASHBOARD_HTML = r"""<!doctype html>
     document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>setTab(btn.dataset.tab)));
     function normalizeTrailingInput(event){const input=event.target;if(!input.matches('[data-preset-field="trail_start"],[data-preset-field="trail_distance"]'))return;const row=input.closest('.preset-row'),start=row.querySelector('[data-preset-field="trail_start"]'),distance=row.querySelector('[data-preset-field="trail_distance"]');if(Number(input.value)<=0){start.value='0';distance.value='0'}}
     document.getElementById('runForm').addEventListener('input',event=>{normalizeTrailingInput(event);if(!bot?.running)formDirty=true;updatePresetRisk()});document.getElementById('runForm').addEventListener('change',event=>{normalizeTrailingInput(event);if(!bot?.running)formDirty=true;updatePresetRisk()});
-    function table(id,headers,rows,empty='No data'){const el=document.getElementById(id);if(!rows.length){el.innerHTML=`<tr><td class="empty">${empty}</td></tr>`;return}el.innerHTML=`<thead><tr>${headers.map(h=>`<th>${h[0]}</th>`).join('')}</tr></thead><tbody>`+rows.map(row=>`<tr>${headers.map(h=>`<td>${h[1](row)}</td>`).join('')}</tr>`).join('')+'</tbody>'}
+    function table(id,headers,rows,empty='No data'){const el=document.getElementById(id);if(!rows.length){el.innerHTML=`<tr><td class="empty">${empty}</td></tr>`;return}el.innerHTML=`<thead><tr>${headers.map(h=>`<th>${h[0]}</th>`).join('')}</tr></thead><tbody>`+rows.map((row,i)=>`<tr>${headers.map(h=>`<td>${h[1](row,i)}</td>`).join('')}</tr>`).join('')+'</tbody>'}
     function drawEquity(rows){const svg=document.getElementById('equity'),w=svg.clientWidth||900,h=svg.clientHeight||280,p=28;if(!rows.length){svg.innerHTML='<text x="50%" y="50%" text-anchor="middle" fill="#91a09b">No closed trades yet</text>';return}const ys=rows.map(r=>Number(r.cumulative)),minY=Math.min(0,...ys),maxY=Math.max(0,...ys),span=Math.max(.0001,maxY-minY),grouped={};for(const row of rows)(grouped[row.preset_key||'legacy']||=[]).push(row);const all=rows.slice().sort((a,b)=>Number(a.ts)-Number(b.ts)),indexOf=new Map(all.map((r,i)=>[r,i])),x=row=>p+(all.length===1?0:indexOf.get(row)*(w-p*2)/(all.length-1)),y=v=>h-p-((v-minY)/span)*(h-p*2),zero=y(0);const lines=Object.entries(grouped).map(([key,items])=>`<polyline points="${items.map(r=>`${x(r)},${y(Number(r.cumulative))}`).join(' ')}" fill="none" stroke="${presetColors[key]||'#7bb7ff'}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>`).join(''),markers=rows.map(r=>`<circle cx="${x(r)}" cy="${y(Number(r.cumulative))}" r="4.5" fill="${Number(r.pnl)>=0?'#4fd18b':'#ef735f'}" stroke="#0b0f0e" stroke-width="1.5"><title>${esc(r.preset_name||r.preset_key||'preset')} | ${esc(r.market_slug||'n/a')} | PnL ${Number(r.pnl)>=0?'+':''}${fmt(r.pnl)}</title></circle>`).join('');svg.setAttribute('viewBox',`0 0 ${w} ${h}`);svg.innerHTML=`<line x1="${p}" x2="${w-p}" y1="${zero}" y2="${zero}" stroke="#2a3633"/>${lines}${markers}`}
     function logClass(line){if(/stderr|fetch\/error|HTTP Error|Traceback|Error:/i.test(line))return'log-error';if(/Market target price:/i.test(line))return'log-target';if(/PAPER ENTER| ENTER /.test(line))return'log-enter';if(/PAPER EXIT| EXIT /.test(line))return'log-exit';if(/ARB /.test(line))return'log-arb';if(/ HOLD /.test(line))return'log-hold';if(/ WATCH |watch bid=|tick complete/.test(line))return'log-watch';if(/started|Slug:|Market end:|Watcher end:|Outcomes:|Strategies:|No wallet/.test(line))return'log-start';if(/ended|Paper trades|Arb events|No paper trades|No arb events|summary/i.test(line))return'log-end';if(/^\s*$/.test(line))return'log-muted';return'log-line'}
     function colorizeLogLine(line){const safe=esc(line).replace(/^(\[[^\]]+\])/,'<span class="log-time">$1</span>');return`<span class="log-line ${logClass(line)}">${safe}</span>`}
-    function renderTerminal(stdoutLines,stderrLines){const lines=[];for(const line of stdoutLines||[])lines.push(line);if((stderrLines||[]).length){if(lines.length)lines.push('');lines.push('[stderr]');for(const line of stderrLines)lines.push(line)}for(const id of['terminal','terminalLive']){const terminal=document.getElementById(id);if(!lines.length){terminal.textContent='Waiting for bot logs...';continue}terminal.innerHTML=lines.map(colorizeLogLine).join('\n');requestAnimationFrame(()=>{terminal.scrollTop=terminal.scrollHeight})}}
+    function renderTerminalPane(id,lines,emptyText){const terminal=document.getElementById(id);if(!terminal)return;const items=lines||[],nearBottom=terminal.scrollHeight-terminal.scrollTop-terminal.clientHeight<36;if(!items.length){terminal.textContent=emptyText;return}terminal.innerHTML=items.map(colorizeLogLine).join('\n');if(nearBottom)requestAnimationFrame(()=>{terminal.scrollTop=terminal.scrollHeight})}
+    function renderTerminal(stdoutLines,stderrLines){renderTerminalPane('terminalInfo',stdoutLines,'Waiting for bot logs...');renderTerminalPane('terminalError',stderrLines,'No error logs.')}
     function formPayload(){const form=new FormData(document.getElementById('runForm')),payload={};for(const[key,value]of form.entries())payload[key]=String(value).trim();for(const key of['seconds'])if(!payload[key])delete payload[key];payload.presets=collectPresets();return payload}
     function formFieldIsFocused(){const active=document.activeElement;return Boolean(active&&document.getElementById('runForm').contains(active)&&['INPUT','SELECT'].includes(active.tagName))}
-    function syncPresetConfig(presets){if(!Array.isArray(presets))return;for(const preset of presets){const row=document.querySelector(`.preset-row[data-preset="${preset.key}"]`);if(!row)continue;for(const[key,value]of Object.entries(preset)){const input=row.querySelector(`[data-preset-field="${key}"]`);if(!input)continue;if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value}}updatePresetRisk()}
+    function syncPresetConfig(presets){if(!Array.isArray(presets))return;for(const preset of presets){let row=document.querySelector(`.preset-row[data-preset="${preset.key}"]`);if(!row){document.getElementById('presetBoard').insertAdjacentHTML('beforeend',presetRowHtml(preset));row=document.querySelector(`.preset-row[data-preset="${preset.key}"]`)}if(!row)continue;row.querySelector('h3').textContent=preset.name||preset.key;for(const[key,value]of Object.entries(preset)){const input=row.querySelector(`[data-preset-field="${key}"]`);if(!input)continue;if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value}}updatePresetRisk()}
     function syncFormConfig(config){for(const[key,value]of Object.entries(config)){if(key==='presets')continue;const input=document.getElementById(key);if(input&&value!==null&&value!==undefined){if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value}}syncPresetConfig(config.presets);formHydrated=true}
     async function postJSON(url,payload={}){const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await res.json();if(!res.ok)throw new Error(data.error||`Request failed: ${res.status}`);return data}
-    function renderBotStatus(data,options={}){bot=data;document.getElementById('botDot').classList.toggle('on',Boolean(data.running));document.getElementById('botStatus').textContent=data.running?`Running PID ${data.pid} since ${data.started_at||'now'}`:(data.returncode===null?'Bot idle':`Bot stopped, code ${data.returncode}`);document.getElementById('pidPill').textContent=data.running?`PID ${data.pid}`:'Not running';document.getElementById('dataFile').textContent=data.data_file?`Data: ${data.data_file}`:'Data: no run yet';document.getElementById('dataFile').title=data.db_path||'';document.getElementById('startBtn').disabled=Boolean(data.running);document.getElementById('stopBtn').disabled=!data.running;document.getElementById('resetBtn').disabled=Boolean(data.running);document.querySelectorAll('#runForm input,#runForm select').forEach(input=>{input.disabled=Boolean(data.running)});const hasConfig=Boolean(data.config&&data.config.url),shouldSyncForm=hasConfig&&(options.forceFormSync||data.running||!formHydrated||!formDirty)&&(options.forceFormSync||!formFieldIsFocused());if(shouldSyncForm)syncFormConfig(data.config);renderTerminal(data.stdout_tail||[],data.stderr_tail||[])}
+    function renderBotStatus(data,options={}){bot=data;document.getElementById('botDot').classList.toggle('on',Boolean(data.running));document.getElementById('botStatus').textContent=data.running?`Running PID ${data.pid} since ${data.started_at||'now'}`:(data.returncode===null?'Bot idle':`Bot stopped, code ${data.returncode}`);document.getElementById('pidPill').textContent=data.running?`PID ${data.pid}`:'Not running';document.getElementById('dataFile').textContent=data.data_file?`Data: ${data.data_file}`:'Data: no run yet';document.getElementById('dataFile').title=data.db_path||'';document.getElementById('startBtn').disabled=Boolean(data.running);document.getElementById('stopBtn').disabled=!data.running;document.getElementById('resetBtn').disabled=Boolean(data.running);document.getElementById('presetAddBtn').disabled=Boolean(data.running);document.getElementById('presetSweepBtn').disabled=Boolean(data.running);document.querySelectorAll('#runForm input,#runForm select').forEach(input=>{input.disabled=Boolean(data.running)});const hasConfig=Boolean(data.config&&data.config.url),shouldSyncForm=hasConfig&&(options.forceFormSync||data.running||!formHydrated||!formDirty)&&(options.forceFormSync||!formFieldIsFocused());if(shouldSyncForm)syncFormConfig(data.config);document.querySelectorAll('[data-preset-remove]').forEach(btn=>{btn.disabled=Boolean(data.running)});renderTerminal(data.stdout_tail||[],data.stderr_tail||[])}
     async function refreshBot(){const res=await fetch('/api/bot/status',{cache:'no-store'});renderBotStatus(await res.json())}
     async function runCommand(action){const notice=document.getElementById('controlNotice');try{if(action==='start'){notice.textContent='Starting bot...';const status=await postJSON('/api/bot/start',formPayload());formDirty=false;renderBotStatus(status,{forceFormSync:true});await refresh();notice.textContent='Bot started.'}else if(action==='stop'){notice.textContent='Stopping bot...';renderBotStatus(await postJSON('/api/bot/stop'),{forceFormSync:true});await refresh();notice.textContent='Bot stopped.'}else if(action==='reset'){notice.textContent='Clearing local data...';renderBotStatus(await postJSON('/api/data/reset'));await refresh();notice.textContent='Local data cleared.'}else if(action==='close'){notice.textContent='Closing app and stopping bot...';await postJSON('/api/app/shutdown');notice.textContent='App closed. You can close this browser tab.';setTimeout(()=>window.close(),300)}}catch(error){notice.textContent=error.message}}
     function presetConfigByKey(){const config=state?.run?.config?.presets||collectPresets();return Object.fromEntries(config.map(p=>[p.key,p]))}
     function plannedRR(row){const p=presetConfigByKey()[row.preset_key];if(!p)return'<span class="subtle">n/a</span>';const rr=rrMetrics(p);return Number.isFinite(rr.avg)?`${rr.avg.toFixed(2)}R`:'<span class="neg">Invalid</span>'}
-    function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">All presets</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all'}
+    function pfCell(row){if(row.profit_factor_infinite)return'<span class="pos">∞</span>';return row.profit_factor===null||row.profit_factor===undefined?'<span class="subtle">n/a</span>':fmt(row.profit_factor,2)}
+    function renderPresetFilter(){const select=document.getElementById('presetFilter'),current=select.value,keys=new Map();for(const p of collectPresets())keys.set(p.key,p.name);for(const row of state?.trades||[])keys.set(row.preset_key,row.preset_name||row.preset_key);select.innerHTML='<option value="all">All presets</option>'+[...keys.entries()].map(([key,name])=>`<option value="${esc(key)}">${esc(name)}</option>`).join('');select.value=keys.has(current)?current:'all';select.disabled=tradeJournalMode==='manual'}
     function renderDecisionBoard(data){const active=data.active_positions||[],snaps=data.snapshots||[],keys=collectPresets().map(p=>p.key);document.getElementById('decisionBoard').innerHTML=keys.map(key=>{const open=active.filter(r=>r.preset_key===key),latest=snaps.find(r=>r.preset_key===key),status=open.length?'HOLD':(latest?'WATCH':'WAIT');return`<div class="decision-card ${esc(key)}"><div class="row" style="justify-content:space-between"><strong>${esc(presetNames[key]||key)}</strong><span class="pill">${status}</span></div><p class="subtle">Open: ${open.length} | Bid ${valueMaybe(latest?.bid,2)} | Ask ${valueMaybe(latest?.ask,2)}</p><p class="subtle">${esc(latest?.time||'no snapshot')}</p></div>`}).join('')}
     const manualTicket={side:'buy',outcome:'Up',amountUsd:1,percent:100,notice:''};
     function manualData(){return state?.manual_trade||{outcomes:[]}}
     function manualOutcomeData(outcome){return(manualData().outcomes||[]).find(row=>String(row.outcome).toLowerCase()===String(outcome).toLowerCase())||{}}
-    function centsHtml(value){const n=Number(value);return Number.isFinite(n)&&n>0?`${Math.round(n*100)}&cent;`:'--'}
+    function centsHtml(value,digits=0){const n=Number(value);return Number.isFinite(n)&&n>0?`${(n*100).toFixed(digits)}&cent;`:'--'}
+    function centsText(value,digits=0){const n=Number(value);return Number.isFinite(n)&&n>0?`${(n*100).toFixed(digits)}c`:'--'}
+    function shareText(value){const n=Number(value||0);if(!Number.isFinite(n)||n<=0)return'0';return n.toFixed(n>=100?2:4).replace(/\.?0+$/,'')}
     const usd=n=>`$${Number(n||0).toFixed(2)}`;
     function manualMarketTitle(trade){const title=String(trade?.title||trade?.market_slug||'BTC Up or Down 5m');return /btc.*updown.*5m|btc up or down/i.test(title)?'BTC Up or Down 5m':title}
     function manualMarketTimeLabel(trade){const start=Number(trade?.start_ts),end=Number(trade?.end_ts);if(!Number.isFinite(start)||!Number.isFinite(end)||start<=0||end<=0)return'';try{const zone='America/New_York',startDate=new Date(start*1000),endDate=new Date(end*1000),dateFmt=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric'}),timeFmt=new Intl.DateTimeFormat('en-US',{timeZone:zone,hour:'numeric',minute:'2-digit',hour12:true}),startDay=dateFmt.format(startDate),endDay=dateFmt.format(endDate);return startDay===endDay?`${startDay}, ${timeFmt.format(startDate)}-${timeFmt.format(endDate)} ET`:`${startDay}, ${timeFmt.format(startDate)}-${endDay}, ${timeFmt.format(endDate)} ET`}catch{return''}}
-    function renderManualTrade(data){const trade=data.manual_trade||{},selected=manualOutcomeData(manualTicket.outcome),isBuy=manualTicket.side==='buy',price=isBuy?selected.ask:selected.bid,shares=Number(selected.position_shares||0),available=Number(trade.available_budget_usd??0),budgetOk=!isBuy||Number(manualTicket.amountUsd)<=available+1e-9,priceAtCeiling=isBuy&&Number(selected.ask)>=1-1e-9,canSubmit=Number(price)>0&&(isBuy?budgetOk&&!priceAtCeiling:shares>0);document.getElementById('manualMarketTitle').textContent=manualMarketTitle(trade);const marketTime=document.getElementById('manualMarketTime'),marketTimeLabel=manualMarketTimeLabel(trade);marketTime.textContent=marketTimeLabel;marketTime.classList.toggle('hidden',!marketTimeLabel);const budgetInput=document.getElementById('manualBudgetInput');if(document.activeElement!==budgetInput)budgetInput.value=Number(trade.budget_usd??100).toFixed(2);document.getElementById('manualBudgetAvailable').textContent=usd(available);document.getElementById('manualAccountPnl').innerHTML=money(trade.total_pnl);document.getElementById('manualSelectedLabel').textContent=manualTicket.outcome;document.querySelectorAll('[data-manual-side]').forEach(btn=>btn.classList.toggle('active',btn.dataset.manualSide===manualTicket.side));document.querySelectorAll('[data-manual-outcome]').forEach(btn=>btn.classList.toggle('active',btn.dataset.manualOutcome===manualTicket.outcome));document.getElementById('manualUpPrice').innerHTML=centsHtml(isBuy?manualOutcomeData('Up').ask:manualOutcomeData('Up').bid);document.getElementById('manualDownPrice').innerHTML=centsHtml(isBuy?manualOutcomeData('Down').ask:manualOutcomeData('Down').bid);document.getElementById('manualBuyPane').classList.toggle('hidden',!isBuy);document.getElementById('manualSellPane').classList.toggle('hidden',isBuy);document.querySelectorAll('[data-manual-amount]').forEach(btn=>btn.classList.toggle('active',Number(btn.dataset.manualAmount)===Number(manualTicket.amountUsd)));document.querySelectorAll('[data-manual-percent]').forEach(btn=>btn.classList.toggle('active',Number(btn.dataset.manualPercent)===Number(manualTicket.percent)));for(const amount of[1,2,5]){const quote=Number(price);document.getElementById(`manualWin${amount}`).innerHTML=quote>0?`win $${(amount/quote).toFixed(2)}`:'win --'}document.getElementById('manualCashLine').textContent=`${usd(manualTicket.amountUsd)} paper | available ${usd(available)}`;document.getElementById('manualShares').textContent=shares.toFixed(shares>=10?0:2);const submit=document.getElementById('manualSubmit');submit.textContent=`${isBuy?'Buy':'Sell'} ${manualTicket.outcome}`;submit.disabled=!canSubmit;document.getElementById('manualNotice').textContent=manualTicket.notice||(!trade.enabled?'Waiting for live prices...':(priceAtCeiling?`${manualTicket.outcome} is already 100c`:(!budgetOk?'Manual budget exceeded':'')))}
-    async function submitManualTrade(){const submit=document.getElementById('manualSubmit');manualTicket.notice='Sending paper order...';renderManualTrade(state||{});submit.disabled=true;try{const payload={side:manualTicket.side,outcome:manualTicket.outcome,amount_usd:manualTicket.amountUsd,percent:manualTicket.percent},data=await postJSON('/api/manual-trade',payload),result=data.manual_result||{};manualTicket.notice=result.side==='sell'?`Sold ${result.outcome}: PnL ${Number(result.pnl||0).toFixed(4)}`:`Bought ${result.outcome}: ${Number(result.shares||0).toFixed(4)} shares`;render(data)}catch(error){manualTicket.notice=error.message;renderManualTrade(state||{})}}
+    function clearSettledManualNotice(trade){if(manualTicket.notice.startsWith('Bought ')&&Number(trade.open_positions||0)<=0)manualTicket.notice=''}
+    function ensureManualPositionSummary(){let el=document.getElementById('manualPositionSummary');if(el)return el;const row=document.querySelector('#manualTicket .manual-outcome-row');if(!row)return null;el=document.createElement('div');el.id='manualPositionSummary';el.className='manual-position-summary';el.innerHTML='<div><span>Shares</span><strong id="manualPositionShares">0</strong></div><div><span>Avg cost</span><strong id="manualAvgCost">--</strong></div><div><span>Cost basis</span><strong id="manualPositionCost">$0.00</strong></div><div><span>Unrealized PnL</span><strong id="manualPositionPnl"><span class="subtle">n/a</span></strong></div>';row.after(el);return el}
+    function renderManualPositionSummary(selected){if(!ensureManualPositionSummary())return;const shares=Number(selected.position_shares||0),avg=Number(selected.position_average_price??selected.position_entry_price??0),cost=Number(selected.position_size_usd||0),pnl=selected.position_unrealized_pnl;document.getElementById('manualPositionShares').textContent=shareText(shares);document.getElementById('manualAvgCost').innerHTML=avg>0?centsHtml(avg,2):'--';document.getElementById('manualPositionCost').textContent=usd(cost);document.getElementById('manualPositionPnl').innerHTML=pnl===null||pnl===undefined?'<span class="subtle">n/a</span>':money(pnl)}
+    function renderManualTrade(data){
+      const trade=data.manual_trade||{},selected=manualOutcomeData(manualTicket.outcome),isBuy=manualTicket.side==='buy',price=isBuy?selected.ask:selected.bid,shares=Number(selected.position_shares||0),available=Number(trade.available_budget_usd??0),budgetOk=!isBuy||Number(manualTicket.amountUsd)<=available+1e-9,priceAtCeiling=isBuy&&Number(selected.ask)>=1-1e-9,canSubmit=Number(price)>0&&(isBuy?budgetOk&&!priceAtCeiling:shares>0);
+      renderManualPositionSummary(selected);
+      document.getElementById('manualMarketTitle').textContent=manualMarketTitle(trade);
+      const marketTime=document.getElementById('manualMarketTime'),marketTimeLabel=manualMarketTimeLabel(trade);
+      marketTime.textContent=marketTimeLabel;marketTime.classList.toggle('hidden',!marketTimeLabel);
+      const budgetInput=document.getElementById('manualBudgetInput');
+      if(document.activeElement!==budgetInput)budgetInput.value=Number(trade.budget_usd??100).toFixed(2);
+      document.getElementById('manualBudgetAvailable').textContent=usd(available);
+      document.getElementById('manualAccountPnl').innerHTML=money(trade.total_pnl);
+      document.getElementById('manualSelectedLabel').textContent=manualTicket.outcome;
+      document.querySelectorAll('[data-manual-side]').forEach(btn=>btn.classList.toggle('active',btn.dataset.manualSide===manualTicket.side));
+      document.querySelectorAll('[data-manual-outcome]').forEach(btn=>btn.classList.toggle('active',btn.dataset.manualOutcome===manualTicket.outcome));
+      document.getElementById('manualUpPrice').innerHTML=centsHtml(isBuy?manualOutcomeData('Up').ask:manualOutcomeData('Up').bid);
+      document.getElementById('manualDownPrice').innerHTML=centsHtml(isBuy?manualOutcomeData('Down').ask:manualOutcomeData('Down').bid);
+      document.getElementById('manualBuyPane').classList.toggle('hidden',!isBuy);
+      document.getElementById('manualSellPane').classList.toggle('hidden',isBuy);
+      document.querySelectorAll('[data-manual-amount]').forEach(btn=>btn.classList.toggle('active',Number(btn.dataset.manualAmount)===Number(manualTicket.amountUsd)));
+      document.querySelectorAll('[data-manual-percent]').forEach(btn=>btn.classList.toggle('active',Number(btn.dataset.manualPercent)===Number(manualTicket.percent)));
+      for(const amount of[1,2,5]){const quote=Number(price);document.getElementById(`manualWin${amount}`).innerHTML=quote>0?`win $${(amount/quote).toFixed(2)}`:'win --'}
+      document.getElementById('manualCashLine').textContent=`${usd(manualTicket.amountUsd)} paper | available ${usd(available)}`;
+      document.getElementById('manualShares').textContent=shareText(shares);
+      const submit=document.getElementById('manualSubmit');
+      submit.textContent=`${isBuy?'Buy':'Sell'} ${manualTicket.outcome}`;
+      submit.disabled=!canSubmit;
+      document.getElementById('manualNotice').textContent=manualTicket.notice||(!trade.enabled?'Waiting for live prices...':(priceAtCeiling?`${manualTicket.outcome} is already 100c`:(!budgetOk?'Manual budget exceeded':'')))
+    }
+    async function submitManualTrade(){
+      const submit=document.getElementById('manualSubmit');
+      manualTicket.notice='Sending paper order...';renderManualTrade(state||{});submit.disabled=true;
+      try{
+        const payload={side:manualTicket.side,outcome:manualTicket.outcome,amount_usd:manualTicket.amountUsd,percent:manualTicket.percent},data=await postJSON('/api/manual-trade',payload),result=data.manual_result||{};
+        manualTicket.notice=result.side==='sell'?`Sold ${result.outcome}: PnL ${Number(result.pnl||0).toFixed(4)}`:`Bought ${result.outcome}: +${shareText(result.shares)} shares at ${centsText(result.price)}`;
+        render(data)
+      }catch(error){manualTicket.notice=error.message;renderManualTrade(state||{})}
+    }
     async function saveManualBudget(){manualTicket.notice='Saving budget...';renderManualTrade(state||{});try{const data=await postJSON('/api/manual-budget',{budget_usd:document.getElementById('manualBudgetInput').value});manualTicket.notice='Manual budget saved.';render(data)}catch(error){manualTicket.notice=error.message;renderManualTrade(state||{})}}
     async function resetManualPnl(){manualTicket.notice='Resetting PnL...';renderManualTrade(state||{});try{const data=await postJSON('/api/manual-reset-pnl',{});manualTicket.notice='Manual PnL reset.';render(data)}catch(error){manualTicket.notice=error.message;renderManualTrade(state||{})}}
+    function labelOverviewRecentTrades(){const title=document.getElementById('overviewRecentTrades')?.closest('.panel')?.querySelector('h2');if(title)title.textContent='Recent auto trades'}
     function organizeDashboardLayout(){const overview=document.getElementById('overview'),trades=document.getElementById('trades'),metrics=document.getElementById('metrics');if(!overview||!trades||!metrics||document.getElementById('overviewMarketRow'))return;const panelFor=id=>document.getElementById(id)?.closest('.panel'),row=(id,cls)=>{const el=document.createElement('div');el.id=id;el.className=`grid overview-row ${cls}`;return el},marketRow=row('overviewMarketRow','overview-market-row'),performanceRow=row('overviewPerformanceRow','overview-performance-row'),manualRow=row('overviewManualRow','overview-manual-row'),activePanel=panelFor('activeOverview'),equityPanel=panelFor('equity'),presetPanel=panelFor('presetSummary'),healthPanel=panelFor('health'),manualTicketEl=document.getElementById('manualTicket'),journalPanel=panelFor('overviewRecentTrades'),marketPanel=panelFor('markets'),outcomePanel=panelFor('outcomes');if(activePanel&&equityPanel)marketRow.append(activePanel,equityPanel);if(presetPanel&&healthPanel)performanceRow.append(presetPanel,healthPanel);if(manualTicketEl&&journalPanel)manualRow.append(manualTicketEl,journalPanel);metrics.after(marketRow,performanceRow,manualRow);if(marketPanel&&outcomePanel){const tradesRow=document.createElement('div');tradesRow.id='tradesInsightRow';tradesRow.className='grid trades-insight-row';tradesRow.append(marketPanel,outcomePanel);trades.append(tradesRow)}overview.querySelectorAll('.manual-overview,.two').forEach(el=>{if(!el.children.length)el.remove()})}
-    function renderRealtimeBits(data){renderActiveMarketReference(data);renderManualTrade(data);table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data)}
-    function render(data){state=data;document.getElementById('generated').textContent=`Updated ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetSummary',[['Preset',presetChip],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'No closed trades yet');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} positions`;renderActiveMarketReference(data);renderManualTrade(data);table('activeOverview',[['Position',activePositionCell],['Price',activePriceCell],['PnL',activePnlCell]],activeRows,'No open positions');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Stop losses</span> ${data.health.stop_loss_count}</p><p><span class="pill">Largest loss</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Top 3 PnL share</span> ${pct(data.health.top_3_share)}</p><p class="subtle">If profits are concentrated in a few trades, keep paper trading before increasing size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('overviewRecentTrades',[['Preset',presetChip],['Outcome',r=>r.outcome],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)]],(data.trades||[]).slice(0,8),'No closed trades yet');table('activePositions',[['Position',activePositionCell],['Price',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'No open positions');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">No arb events yet.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Type',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
-    function renderTrades(){if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,rows=state.trades.filter(r=>{const hay=`${r.market_slug} ${r.outcome} ${r.exit_reason} ${r.entry_reason} ${r.preset_name}`.toLowerCase();if(q&&!hay.includes(q))return false;if(presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true});table('tradesTable',[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Opened',r=>r.entry_time],['Closed',r=>r.exit_time],['Held',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],rows,'No matching trades')}
-    document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
+    function renderRealtimeBits(data){clearSettledManualNotice(data.manual_trade||{});renderActiveMarketReference(data);renderManualTrade(data);table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data)}
+    function render(data){state=data;document.getElementById('generated').textContent=`Updated ${data.generated_at}`;renderPresetFilter();const o=data.overall;document.getElementById('metrics').innerHTML=[['Trades',o.trades],['PnL closed',money(o.pnl)],['Open PnL',money(o.active_unrealized_pnl)],['Total PnL',money(o.total_with_active_pnl)],['Win rate',pct(o.win_rate)],['ROI size',pct(o.roi)]].map(m=>`<div class="panel metric"><div class="label">${m[0]}</div><div class="value">${m[1]}</div></div>`).join('');table('presetRanking',[['Rank',(_,i)=>`#${i+1}`],['Preset',presetChip],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['PF',pfCell],['Max DD',r=>money(-Number(r.max_drawdown||0))],['Stop loss %',r=>pct(r.stop_loss_rate)],['Avg PnL',r=>money(r.avg_pnl)]],data.preset_rankings||[],'No closed trades yet');table('presetSummary',[['Preset',presetChip],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Avg PnL',r=>money(r.avg_pnl)],['Risk exits',r=>r.risk_exits]],data.preset_summary||[],'No closed trades yet');const activeRows=data.active_positions||[];document.getElementById('activeOverviewCount').textContent=`${activeRows.length} positions`;renderActiveMarketReference(data);renderManualTrade(data);table('activeOverview',[['Position',activePositionCell],['Price',activePriceCell],['PnL',activePnlCell]],activeRows,'No open positions');drawEquity(data.preset_equity||data.equity||[]);document.getElementById('health').innerHTML=`<p><span class="pill">Stop losses</span> ${data.health.stop_loss_count}</p><p><span class="pill">Largest loss</span> ${money(data.health.largest_loss)}</p><p><span class="pill">Top 3 PnL share</span> ${pct(data.health.top_3_share)}</p><p class="subtle">If profits are concentrated in a few trades, keep paper trading before increasing size.</p>`;table('markets',[['Preset',presetChip],['Market',r=>r.market_slug],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Worst',r=>money(r.worst)]],data.markets||[]);table('outcomes',[['Preset',presetChip],['Outcome',r=>r.outcome],['Trades',r=>r.trades],['PnL',r=>money(r.pnl)],['Win',r=>pct(r.win_rate)],['Avg entry',r=>fmt(r.avg_entry,2)],['Risk exits',r=>r.risk_exits]],data.outcomes||[]);renderTrades();table('overviewRecentTrades',[['Preset',presetChip],['Outcome',r=>r.outcome],['Entry',r=>fmt(r.entry_price,2)],['Shares bought',r=>shareText(r.shares)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)]],(data.trades||[]).slice(0,8),'No closed trades yet');table('activePositions',[['Position',activePositionCell],['Price',activePriceCell],['PnL',activePnlCell],['Reason',r=>esc(r.entry_reason||'')]],activeRows,'No open positions');table('snapshots',[['Time',r=>r.time],['Preset',presetChip],['Label',r=>esc(r.label)],['Bid',r=>fmt(r.bid,2)],['Ask',r=>fmt(r.ask,2)],['Bid size',r=>fmt(r.bid_size,2)],['Ask size',r=>fmt(r.ask_size,2)],['Age',r=>r.book_age_ms===null||r.book_age_ms===undefined?'n/a':`${Math.round(Number(r.book_age_ms))}ms`]],data.snapshots||[]);renderDecisionBoard(data);document.getElementById('arbSummary').innerHTML=data.arb.length?data.arb.map(r=>`<p><span class="pill">${esc(r.kind)}</span> events=${r.events} max=${fmt(r.max_edge)} avg=${fmt(r.avg_edge)}</p>`).join(''):'<p class="empty">No arb events yet.</p>';table('arbEvents',[['Time',r=>r.time],['Market',r=>r.market_slug],['Type',r=>r.kind],['Up/Yes',r=>fmt(r.yes_price,2)],['Down/No',r=>fmt(r.no_price,2)],['Edge',r=>money(r.edge)]],data.arb_events||[])}
+    function renderJournalTabs(){document.querySelectorAll('[data-journal-mode]').forEach(btn=>{const active=btn.dataset.journalMode===tradeJournalMode;btn.classList.toggle('active',active);btn.setAttribute('aria-selected',active?'true':'false')});const preset=document.getElementById('presetFilter');if(preset)preset.disabled=tradeJournalMode==='manual'}
+    function journalHaystack(row){return`${row.market_slug} ${row.outcome} ${row.exit_reason} ${row.entry_reason} ${row.preset_name} ${row.label}`.toLowerCase()}
+    function renderTrades(){renderJournalTabs();if(!state)return;const q=document.getElementById('filter').value.toLowerCase(),presetMode=document.getElementById('presetFilter').value,mode=document.getElementById('resultFilter').value,manual=tradeJournalMode==='manual',sourceRows=manual?(state.manual_trades||[]):(state.trades||[]),rows=sourceRows.filter(r=>{const hay=journalHaystack(r);if(q&&!hay.includes(q))return false;if(!manual&&presetMode!=='all'&&r.preset_key!==presetMode)return false;if(mode==='wins'&&Number(r.pnl)<=0)return false;if(mode==='losses'&&Number(r.pnl)>=0)return false;return true}),autoHeaders=[['Preset',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Opened',r=>r.entry_time],['Closed',r=>r.exit_time],['Held',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Shares bought',r=>shareText(r.shares)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['R:R',plannedRR],['Exit reason',r=>esc(r.exit_reason)]],manualHeaders=[['Source',presetChip],['Market',r=>r.market_slug],['Outcome',r=>r.outcome],['Opened',r=>r.entry_time],['Closed',r=>r.exit_time],['Held',r=>`${r.hold_seconds}s`],['Entry',r=>fmt(r.entry_price,2)],['Shares',r=>shareText(r.shares)],['Exit',r=>fmt(r.exit_price,2)],['PnL',r=>money(r.pnl)],['Exit reason',r=>esc(r.exit_reason)]];table('tradesTable',manual?manualHeaders:autoHeaders,rows,'No matching trades')}
+    document.getElementById('filter').addEventListener('input',renderTrades);document.getElementById('presetFilter').addEventListener('change',renderTrades);document.getElementById('resultFilter').addEventListener('change',renderTrades);document.querySelectorAll('[data-journal-mode]').forEach(btn=>btn.addEventListener('click',()=>{tradeJournalMode=btn.dataset.journalMode;renderTrades()}));document.getElementById('runForm').addEventListener('submit',event=>{event.preventDefault();runCommand('start')});document.getElementById('presetBoard').addEventListener('click',event=>{const button=event.target.closest('[data-preset-remove]');if(button)removePresetRow(button)});document.getElementById('presetAddBtn').addEventListener('click',()=>addPresetRow());document.getElementById('presetSweepBtn').addEventListener('click',addDistanceSweep);document.getElementById('stopBtn').addEventListener('click',()=>runCommand('stop'));document.getElementById('resetBtn').addEventListener('click',()=>runCommand('reset'));document.getElementById('closeAppBtn').addEventListener('click',()=>runCommand('close'));
     document.querySelectorAll('[data-manual-side]').forEach(btn=>btn.addEventListener('click',()=>{manualTicket.side=btn.dataset.manualSide;manualTicket.notice='';renderManualTrade(state||{})}));document.querySelectorAll('[data-manual-outcome]').forEach(btn=>btn.addEventListener('click',()=>{manualTicket.outcome=btn.dataset.manualOutcome;manualTicket.notice='';renderManualTrade(state||{})}));document.querySelectorAll('[data-manual-amount]').forEach(btn=>btn.addEventListener('click',()=>{manualTicket.amountUsd=Number(btn.dataset.manualAmount);manualTicket.notice='';renderManualTrade(state||{})}));document.querySelectorAll('[data-manual-percent]').forEach(btn=>btn.addEventListener('click',()=>{manualTicket.percent=Number(btn.dataset.manualPercent);manualTicket.notice='';renderManualTrade(state||{})}));document.getElementById('manualSubmit').addEventListener('click',submitManualTrade);document.getElementById('manualBudgetSave').addEventListener('click',saveManualBudget);document.getElementById('manualResetPnl').addEventListener('click',resetManualPnl);document.getElementById('manualBudgetInput').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();saveManualBudget()}});
     async function refresh(){const res=await fetch('/api/dashboard',{cache:'no-store'});render(await res.json())}
     async function refreshRealtime(){if(!state)return;const res=await fetch('/api/realtime',{cache:'no-store'}),data=await res.json();state.market_reference=data.market_reference||state.market_reference;state.manual_trade=data.manual_trade||state.manual_trade;state.snapshots=data.snapshots||[];document.getElementById('generated').textContent=`Updated ${data.generated_at}`;renderRealtimeBits(state)}
-    organizeDashboardLayout();updatePresetRisk();refresh();refreshBot();setInterval(refresh,2000);setInterval(refreshRealtime,500);setInterval(refreshBot,2000);
+    labelOverviewRecentTrades();organizeDashboardLayout();updatePresetRisk();refresh();refreshBot();setInterval(refresh,2000);setInterval(refreshRealtime,500);setInterval(refreshBot,2000);
   </script>
 </body>
 </html>"""
@@ -5515,7 +5239,6 @@ def build_parser() -> argparse.ArgumentParser:
     auto = sub.add_parser("watch-url", help="Auto paper-test all built-in strategies for a Polymarket URL/slug")
     auto.add_argument("url_or_slug", help="Polymarket event URL or slug")
     auto.add_argument("--seconds", type=int, help="Optional runtime override. Default: run until market end + buffer")
-    auto.add_argument("--poll", type=int, default=DEFAULT_POLL_SECONDS)
     auto.add_argument("--size-usd", type=float, default=1.0)
     auto.add_argument("--entry-min", type=float, default=DEFAULT_ENTRY_MIN)
     auto.add_argument("--entry-max", type=float, default=DEFAULT_ENTRY_MAX)
@@ -5538,9 +5261,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MARKET_LOCK_AFTER_LOSS,
         help="Stop opening new positions in the current market after any losing trade.",
     )
-    auto.add_argument("--no-entry-after-seconds", type=int, default=DEFAULT_NO_ENTRY_AFTER_SECONDS, help="Do not enter after this many seconds from market start. Use 0 to disable.")
+    auto.add_argument(
+        "--loss-lock-scope",
+        choices=LOSS_LOCK_SCOPES,
+        default=DEFAULT_LOSS_LOCK_SCOPE,
+        help="Scope for losing-trade entry locks: market keeps legacy global lock; preset isolates research configs; none disables it.",
+    )
+    auto.add_argument("--no-entry-after-seconds", type=int, default=DEFAULT_NO_ENTRY_AFTER_SECONDS, help="Do not enter when this many seconds or less remain. Use 0 to disable.")
     auto.add_argument("--max-sum-asks", type=float, default=DEFAULT_MAX_SUM_ASKS, help="Do not enter if selected ask + opposite ask is above this value. Use 0 to disable.")
-    auto.add_argument("--arb-buffer", type=float, default=0.01, help="Extra slippage/safety buffer after taker fees")
+    auto.add_argument("--arb-buffer", type=float, default=DEFAULT_ARB_BUFFER, help="Extra slippage/safety buffer after taker fees")
     auto.add_argument(
         "--fee-rate",
         type=float,
@@ -5569,21 +5298,19 @@ def build_parser() -> argparse.ArgumentParser:
     directional.add_argument("--late-seconds", type=int, default=30)
     directional.add_argument("--entry-window-seconds", type=int, default=0, help="Only enter with this many seconds or less remaining. Use 0 to disable.")
     directional.add_argument("--min-distance-usd", type=float, default=50.0)
-    directional.add_argument("--poll", type=int, default=DEFAULT_POLL_SECONDS)
     directional.add_argument("--seconds", type=int, default=900)
 
     arb = sub.add_parser("watch-arb", help="Watch YES+NO complete-set pricing")
     arb.add_argument("--yes-token-id", required=True)
     arb.add_argument("--no-token-id", required=True)
     arb.add_argument("--label", required=True)
-    arb.add_argument("--buffer", type=float, default=0.01, help="Extra slippage/safety buffer after taker fees")
+    arb.add_argument("--buffer", type=float, default=DEFAULT_ARB_BUFFER, help="Extra slippage/safety buffer after taker fees")
     arb.add_argument(
         "--fee-rate",
         type=float,
         default=DEFAULT_TAKER_FEE_RATE,
         help="Fallback Polymarket taker fee rate if /fee-rate lookup fails. Crypto default: 0.07",
     )
-    arb.add_argument("--poll", type=int, default=DEFAULT_POLL_SECONDS)
     arb.add_argument("--seconds", type=int, default=900)
 
     report_parser = sub.add_parser("report", help="Summarize local paper results")
@@ -5625,7 +5352,6 @@ def main(argv: list[str] | None = None) -> int:
                 late_seconds=args.late_seconds,
                 entry_window_seconds=max(0, args.entry_window_seconds) or None,
                 min_distance_usd=args.min_distance_usd,
-                poll=args.poll,
                 seconds=args.seconds,
                 resolution_source=args.resolution_source,
             )
@@ -5637,7 +5363,6 @@ def main(argv: list[str] | None = None) -> int:
                 label=args.label,
                 buffer=args.buffer,
                 fee_rate=args.fee_rate,
-                poll=args.poll,
                 seconds=args.seconds,
                 db_path=args.db,
             )
@@ -5668,7 +5393,6 @@ def main(argv: list[str] | None = None) -> int:
                     interval_seconds=args.chain_interval_seconds,
                     db_path=args.db,
                     seconds=args.seconds,
-                    poll=args.poll,
                     size_usd=args.size_usd,
                     entry_min=args.entry_min,
                     entry_max=args.entry_max,
@@ -5681,6 +5405,7 @@ def main(argv: list[str] | None = None) -> int:
                     entry_window_seconds=max(0, args.entry_window_seconds),
                     max_trades_per_label_per_market=max(0, args.max_trades_per_label_per_market),
                     market_lock_after_loss=args.market_lock_after_loss,
+                    loss_lock_scope=args.loss_lock_scope,
                     no_entry_after_seconds=max(0, args.no_entry_after_seconds),
                     max_sum_asks=max(0.0, args.max_sum_asks),
                     arb_buffer=args.arb_buffer,
@@ -5694,7 +5419,6 @@ def main(argv: list[str] | None = None) -> int:
                     url_or_slug=args.url_or_slug,
                     db_path=args.db,
                     seconds=args.seconds,
-                    poll=args.poll,
                     size_usd=args.size_usd,
                     entry_min=args.entry_min,
                     entry_max=args.entry_max,
@@ -5707,6 +5431,7 @@ def main(argv: list[str] | None = None) -> int:
                     entry_window_seconds=max(0, args.entry_window_seconds),
                     max_trades_per_label_per_market=max(0, args.max_trades_per_label_per_market),
                     market_lock_after_loss=args.market_lock_after_loss,
+                    loss_lock_scope=args.loss_lock_scope,
                     no_entry_after_seconds=max(0, args.no_entry_after_seconds),
                     max_sum_asks=max(0.0, args.max_sum_asks),
                     arb_buffer=args.arb_buffer,

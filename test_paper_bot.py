@@ -12,7 +12,7 @@ from paper_bot import (
     complete_set_taker_fee,
     DASHBOARD_HTML,
     DEFAULT_CHAIN_COUNT,
-    DEFAULT_POLL_SECONDS,
+    DEFAULT_DASHBOARD_URL_OR_SLUG,
     DirectionalConfig,
     auto_entry_precheck,
     ClockSnapshot,
@@ -74,7 +74,6 @@ def cfg(**overrides):
         late_seconds=30,
         entry_window_seconds=None,
         min_distance_usd=10.0,
-        poll=1,
         seconds=60,
     )
     base.update(overrides)
@@ -239,6 +238,22 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "market_locked_after_loss")
 
+    def test_auto_entry_precheck_reports_preset_loss_lock(self):
+        ok, reason = auto_entry_precheck(
+            book(ask=0.70),
+            book(ask=0.31),
+            now_ts=130,
+            market_start_ts=0,
+            trade_count=0,
+            max_trades_per_label_per_market=1,
+            market_locked=True,
+            no_entry_after_seconds=180,
+            max_sum_asks=1.03,
+            lock_reason="preset_locked_after_loss",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "preset_locked_after_loss")
+
     def test_auto_entry_precheck_blocks_label_reentry(self):
         ok, reason = auto_entry_precheck(
             book(ask=0.70),
@@ -254,7 +269,7 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("max_trades_reached", reason)
 
-    def test_auto_entry_precheck_blocks_late_elapsed_entry(self):
+    def test_auto_entry_precheck_allows_after_market_start_when_time_remains(self):
         ok, reason = auto_entry_precheck(
             book(ask=0.70),
             book(ask=0.31),
@@ -265,9 +280,26 @@ class StrategyTests(unittest.TestCase):
             market_locked=False,
             no_entry_after_seconds=180,
             max_sum_asks=1.03,
+            remaining_seconds=200,
+        )
+        self.assertTrue(ok)
+        self.assertIn("entry_time_ok", reason)
+
+    def test_auto_entry_precheck_blocks_when_remaining_time_is_too_low(self):
+        ok, reason = auto_entry_precheck(
+            book(ask=0.70),
+            book(ask=0.31),
+            now_ts=130,
+            market_start_ts=0,
+            trade_count=0,
+            max_trades_per_label_per_market=1,
+            market_locked=False,
+            no_entry_after_seconds=20,
+            max_sum_asks=1.03,
+            remaining_seconds=20,
         )
         self.assertFalse(ok)
-        self.assertIn("entry_after_cutoff", reason)
+        self.assertIn("entry_too_late", reason)
 
     def test_auto_entry_precheck_blocks_expensive_sum_asks(self):
         ok, reason = auto_entry_precheck(
@@ -280,6 +312,7 @@ class StrategyTests(unittest.TestCase):
             market_locked=False,
             no_entry_after_seconds=180,
             max_sum_asks=1.03,
+            remaining_seconds=200,
         )
         self.assertFalse(ok)
         self.assertIn("sum_asks_too_high", reason)
@@ -295,6 +328,7 @@ class StrategyTests(unittest.TestCase):
             market_locked=False,
             no_entry_after_seconds=180,
             max_sum_asks=1.03,
+            remaining_seconds=200,
         )
         self.assertTrue(ok)
         self.assertIn("sum_asks_ok", reason)
@@ -353,6 +387,57 @@ class StrategyTests(unittest.TestCase):
 
     def test_fee_rate_from_base_fee_bps(self):
         self.assertEqual(fee_rate_from_base_fee(700), 0.07)
+        self.assertEqual(fee_rate_from_base_fee(1000), 0.10)
+
+    def test_record_trade_subtracts_entry_and_exit_taker_fees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                position = PaperPosition(
+                    entry_ts=1_000,
+                    entry_price=0.50,
+                    shares=2.0,
+                    size_usd=1.0,
+                    reason="entry",
+                    fee_rate=0.10,
+                    entry_fee=taker_fee_usdc(2.0, 0.50, 0.10),
+                )
+
+                pnl = paper_bot.record_trade(con, cfg(), position, 0.60, "take_profit")
+                row = con.execute(
+                    "SELECT gross_pnl, entry_fee, exit_fee, total_fee, pnl, fee_rate FROM paper_trades"
+                ).fetchone()
+            finally:
+                con.close()
+
+        self.assertAlmostEqual(row["gross_pnl"], 0.20)
+        self.assertAlmostEqual(row["entry_fee"], 0.05)
+        self.assertAlmostEqual(row["exit_fee"], 0.048)
+        self.assertAlmostEqual(row["total_fee"], 0.098)
+        self.assertAlmostEqual(row["pnl"], 0.102)
+        self.assertAlmostEqual(row["fee_rate"], 0.10)
+        self.assertAlmostEqual(pnl, 0.102)
+
+    def test_active_position_unrealized_pnl_includes_estimated_fees(self):
+        position = PaperPosition(
+            entry_ts=1_000,
+            entry_price=0.50,
+            shares=2.0,
+            size_usd=1.0,
+            reason="entry",
+            fee_rate=0.10,
+            entry_fee=taker_fee_usdc(2.0, 0.50, 0.10),
+        )
+
+        values = paper_bot.active_position_values(cfg(), position, book(bid=0.60, ask=0.61), btc_price=101.0)
+
+        self.assertAlmostEqual(values["gross_unrealized_pnl"], 0.20)
+        self.assertAlmostEqual(values["entry_fee"], 0.05)
+        self.assertAlmostEqual(values["exit_fee_estimate"], 0.048)
+        self.assertAlmostEqual(values["total_fee_estimate"], 0.098)
+        self.assertAlmostEqual(values["unrealized_pnl"], 0.102)
 
     def test_order_book_state_applies_book_and_price_changes(self):
         state = OrderBookState("token-up")
@@ -904,15 +989,21 @@ class StrategyTests(unittest.TestCase):
         config = normalize_bot_config({"url": "btc-updown-5m-1"})
         self.assertEqual(config["chain_count"], DEFAULT_CHAIN_COUNT)
 
-    def test_dashboard_poll_default_is_two_seconds(self):
+    def test_dashboard_risk_defaults_match_ui(self):
         config = normalize_bot_config({"url": "btc-updown-5m-1"})
-        self.assertEqual(config["poll"], DEFAULT_POLL_SECONDS)
-        self.assertEqual(config["poll"], 2)
+        self.assertEqual(config["no_entry_after_seconds"], 15)
+        self.assertEqual(config["entry_window_seconds"], 260)
+        self.assertEqual(config["max_sum_asks"], 1.06)
+        self.assertEqual(config["arb_buffer"], 0.02)
+        self.assertTrue(config["market_lock_after_loss"])
+        self.assertEqual(config["loss_lock_scope"], "preset")
 
     def test_strategy_label_includes_core_settings(self):
-        config = normalize_bot_config({"url": "btc-updown-5m-1", "min_distance_usd": "10", "entry_max": "0.67"})
+        config = normalize_bot_config(
+            {"url": "btc-updown-5m-1", "min_distance_usd": "10", "entry_min": "0.62", "entry_max": "0.70"}
+        )
         label = strategy_label(config)
-        self.assertIn("custom_e0.65-0.67", label)
+        self.assertIn("custom_e0.62-0.7", label)
         self.assertIn("tp0.88", label)
         self.assertIn("dist10", label)
         self.assertIn("lock", label)
@@ -921,19 +1012,31 @@ class StrategyTests(unittest.TestCase):
         config = normalize_bot_config({"url": "btc-updown-5m-1"})
         self.assertEqual([preset["key"] for preset in config["presets"]], ["safe", "balanced", "aggressive"])
         self.assertTrue(all(preset["enabled"] for preset in config["presets"]))
-        self.assertEqual(config["presets"][0]["take_profit"], 0.84)
-        self.assertEqual(config["presets"][0]["min_distance_usd"], 100.0)
-        self.assertEqual(config["presets"][0]["trail_start"], 0.05)
-        self.assertEqual(config["presets"][0]["trail_distance"], 0.04)
+        self.assertEqual(config["presets"][0]["entry_min"], 0.62)
+        self.assertEqual(config["presets"][0]["entry_max"], 0.70)
+        self.assertEqual(config["presets"][0]["take_profit"], 0.88)
+        self.assertEqual(config["presets"][0]["stop_loss"], 0.54)
+        self.assertEqual(config["presets"][0]["late_seconds"], 50)
+        self.assertEqual(config["presets"][0]["min_distance_usd"], 25.0)
+        self.assertEqual(config["presets"][0]["trail_start"], 0.07)
+        self.assertEqual(config["presets"][0]["trail_distance"], 0.05)
         self.assertNotIn("hard_exit", config["presets"][0])
-        self.assertEqual(config["presets"][1]["entry_min"], 0.65)
-        self.assertEqual(config["presets"][1]["min_distance_usd"], 75.0)
-        self.assertEqual(config["presets"][1]["trail_start"], 0.05)
-        self.assertEqual(config["presets"][1]["trail_distance"], 0.05)
-        self.assertEqual(config["presets"][2]["entry_max"], 0.72)
-        self.assertEqual(config["presets"][2]["min_distance_usd"], 75.0)
-        self.assertEqual(config["presets"][2]["trail_start"], 0.08)
-        self.assertEqual(config["presets"][2]["trail_distance"], 0.06)
+        self.assertEqual(config["presets"][1]["entry_min"], 0.66)
+        self.assertEqual(config["presets"][1]["entry_max"], 0.74)
+        self.assertEqual(config["presets"][1]["take_profit"], 0.90)
+        self.assertEqual(config["presets"][1]["stop_loss"], 0.58)
+        self.assertEqual(config["presets"][1]["late_seconds"], 50)
+        self.assertEqual(config["presets"][1]["min_distance_usd"], 25.0)
+        self.assertEqual(config["presets"][1]["trail_start"], 0.08)
+        self.assertEqual(config["presets"][1]["trail_distance"], 0.06)
+        self.assertEqual(config["presets"][2]["entry_min"], 0.74)
+        self.assertEqual(config["presets"][2]["entry_max"], 0.82)
+        self.assertEqual(config["presets"][2]["take_profit"], 0.96)
+        self.assertEqual(config["presets"][2]["stop_loss"], 0.68)
+        self.assertEqual(config["presets"][2]["late_seconds"], 40)
+        self.assertEqual(config["presets"][2]["min_distance_usd"], 20.0)
+        self.assertEqual(config["presets"][2]["trail_start"], 0.10)
+        self.assertEqual(config["presets"][2]["trail_distance"], 0.07)
 
     def test_dashboard_config_accepts_custom_preset_values(self):
         config = normalize_bot_config(
@@ -1006,7 +1109,7 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(path.parent, Path(tmp))
         self.assertIn("20260524_115000Z", path.name)
         self.assertIn("btc-updown-5m-1779623400", path.name)
-        self.assertIn("multi_safe-balanced-aggressive_e0.65-0.68", path.name)
+        self.assertIn("multi_safe-balanced-aggressive_e0.62-0.7", path.name)
         self.assertEqual(path.suffix, ".sqlite")
 
     def test_initial_dashboard_db_path_starts_empty_even_when_runs_exist(self):
@@ -1094,12 +1197,20 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("Market target price:", DASHBOARD_HTML)
         self.assertIn("return'log-target'", DASHBOARD_HTML)
 
-    def test_dashboard_terminal_hides_scrollbars(self):
-        self.assertIn("scrollbar-width:none", DASHBOARD_HTML)
-        self.assertIn("-ms-overflow-style:none", DASHBOARD_HTML)
-        self.assertIn(".terminal::-webkit-scrollbar{display:none", DASHBOARD_HTML)
+    def test_dashboard_terminal_splits_info_and_error_logs_with_scrollbars(self):
+        self.assertIn("terminalInfo", DASHBOARD_HTML)
+        self.assertIn("terminalError", DASHBOARD_HTML)
+        self.assertIn("Bot output", DASHBOARD_HTML)
+        self.assertIn("Error log", DASHBOARD_HTML)
+        self.assertIn(".terminal.info{height:360px", DASHBOARD_HTML)
+        self.assertIn(".terminal.error{height:220px", DASHBOARD_HTML)
         self.assertIn("overflow-wrap:anywhere", DASHBOARD_HTML)
-        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto;max-height:100vh;overflow:hidden}", DASHBOARD_HTML)
+        self.assertIn("renderTerminalPane('terminalInfo'", DASHBOARD_HTML)
+        self.assertIn("renderTerminalPane('terminalError'", DASHBOARD_HTML)
+        self.assertNotIn("scrollbar-width:none", DASHBOARD_HTML)
+        self.assertNotIn("-ms-overflow-style:none", DASHBOARD_HTML)
+        self.assertNotIn(".terminal::-webkit-scrollbar{display:none", DASHBOARD_HTML)
+        self.assertNotIn("terminalLive", DASHBOARD_HTML)
 
     def test_dashboard_run_tab_uses_available_viewport_space(self):
         self.assertIn("width:calc(100% - 32px)", DASHBOARD_HTML)
@@ -1107,7 +1218,7 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("min-height:calc(100dvh - 116px)", DASHBOARD_HTML)
         self.assertIn("#run:not(.hidden){display:flex;flex:1;min-height:0}", DASHBOARD_HTML)
         self.assertIn(".run-grid{width:100%;min-height:0", DASHBOARD_HTML)
-        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;height:auto;max-height:100vh;overflow:hidden}", DASHBOARD_HTML)
+        self.assertIn(".terminal-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}", DASHBOARD_HTML)
         self.assertNotIn("body{height:100dvh;overflow:hidden}", DASHBOARD_HTML)
         self.assertNotIn("main{height:calc(100dvh - 116px);overflow:hidden}", DASHBOARD_HTML)
 
@@ -1128,10 +1239,43 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("activePnlCell", DASHBOARD_HTML)
         self.assertIn("['PnL',activePnlCell]", DASHBOARD_HTML)
 
+    def test_dashboard_html_shows_trade_journal_entry_and_shares(self):
+        self.assertIn("['Entry',r=>fmt(r.entry_price,2)]", DASHBOARD_HTML)
+        self.assertIn("['Shares bought',r=>shareText(r.shares)]", DASHBOARD_HTML)
+        self.assertIn("['Shares',r=>shareText(r.shares)]", DASHBOARD_HTML)
+        self.assertIn("table('overviewRecentTrades'", DASHBOARD_HTML)
+        self.assertIn("table('tradesTable'", DASHBOARD_HTML)
+        self.assertIn("data-journal-mode=\"auto\"", DASHBOARD_HTML)
+        self.assertIn("data-journal-mode=\"manual\"", DASHBOARD_HTML)
+        self.assertIn("tradeJournalMode==='manual'", DASHBOARD_HTML)
+        self.assertIn("state.manual_trades||[]", DASHBOARD_HTML)
+        self.assertIn("Recent auto trades", DASHBOARD_HTML)
+
     def test_dashboard_html_polls_realtime_endpoint_between_full_refreshes(self):
         self.assertIn("/api/realtime", DASHBOARD_HTML)
         self.assertIn("refreshRealtime", DASHBOARD_HTML)
         self.assertIn("setInterval(refreshRealtime,500)", DASHBOARD_HTML)
+
+    def test_dashboard_html_uses_requested_default_form_values(self):
+        self.assertIn(f'value="{DEFAULT_DASHBOARD_URL_OR_SLUG}"', DASHBOARD_HTML)
+        self.assertIn('id="chain_count" name="chain_count" type="number" min="1" max="100" step="1" value="30"', DASHBOARD_HTML)
+        self.assertIn("No entry when &lt;= seconds left", DASHBOARD_HTML)
+        self.assertIn('id="no_entry_after_seconds" name="no_entry_after_seconds" type="number" min="0" max="3600" step="1" value="15"', DASHBOARD_HTML)
+        self.assertIn('id="max_sum_asks" name="max_sum_asks" type="number" min="0" max="2" step="0.001" value="1.06"', DASHBOARD_HTML)
+        self.assertIn('id="entry_window_seconds" name="entry_window_seconds" type="number" min="0" max="3600" step="1" value="260"', DASHBOARD_HTML)
+        self.assertIn('id="arb_buffer" name="arb_buffer" type="number" min="0" max="1" step="0.001" value="0.02"', DASHBOARD_HTML)
+        self.assertIn('id="loss_lock_scope" name="loss_lock_scope"', DASHBOARD_HTML)
+        self.assertIn('<option value="preset" selected>Per preset</option>', DASHBOARD_HTML)
+        self.assertNotIn("Scan interval seconds", DASHBOARD_HTML)
+        self.assertNotIn('id="poll"', DASHBOARD_HTML)
+        self.assertIn('data-preset="safe"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="entry_min" type="number" min="0.01" max="0.99" step="0.01" value="0.62"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="entry_max" type="number" min="0.01" max="0.99" step="0.01" value="0.70"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="take_profit" type="number" min="0" max="0.99" step="0.01" value="0.88"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="late_seconds" type="number" min="0" max="300" step="1" value="50"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="min_distance_usd" type="number" min="0" step="1" value="25"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="trail_start" type="number" min="0" max="0.99" step="0.01" value="0.10"', DASHBOARD_HTML)
+        self.assertIn('data-preset-field="min_distance_usd" type="number" min="0" step="1" value="20"', DASHBOARD_HTML)
 
     def test_dashboard_html_includes_preset_matrix_and_rr(self):
         self.assertIn("presetBoard", DASHBOARD_HTML)
@@ -1142,6 +1286,23 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("data-preset-field=\"trail_start\"", DASHBOARD_HTML)
         self.assertIn("data-preset-field=\"trail_distance\"", DASHBOARD_HTML)
         self.assertIn("rrMetrics", DASHBOARD_HTML)
+        self.assertIn("presetAddBtn", DASHBOARD_HTML)
+        self.assertIn("presetSweepBtn", DASHBOARD_HTML)
+        self.assertIn("addPresetRow", DASHBOARD_HTML)
+        self.assertIn("addDistanceSweep", DASHBOARD_HTML)
+        self.assertIn("basePresetKeys", DASHBOARD_HTML)
+        self.assertIn("removePresetRow", DASHBOARD_HTML)
+        self.assertIn("data-preset-remove", DASHBOARD_HTML)
+        self.assertIn("!basePresetKeys.has(p.key)", DASHBOARD_HTML)
+        self.assertIn("if(!row||basePresetKeys.has(key))return", DASHBOARD_HTML)
+        self.assertIn("if(bot?.running)return", DASHBOARD_HTML)
+        self.assertIn("btn.disabled=Boolean(data.running)", DASHBOARD_HTML)
+
+    def test_dashboard_html_includes_preset_research_ranking(self):
+        self.assertIn("presetRanking", DASHBOARD_HTML)
+        self.assertIn("pfCell", DASHBOARD_HTML)
+        self.assertIn("Max DD", DASHBOARD_HTML)
+        self.assertIn("Stop loss %", DASHBOARD_HTML)
 
     def test_dashboard_html_hides_binance_btc_reference_price(self):
         self.assertNotIn("BTC ${valueMaybe(latest?.btc_price", DASHBOARD_HTML)
@@ -1167,6 +1328,22 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("submitManualTrade", DASHBOARD_HTML)
         self.assertIn("priceAtCeiling", DASHBOARD_HTML)
         self.assertIn("is already 100c", DASHBOARD_HTML)
+
+    def test_dashboard_html_clears_stale_manual_buy_notice_after_settlement(self):
+        self.assertIn("clearSettledManualNotice", DASHBOARD_HTML)
+        self.assertIn("manualTicket.notice.startsWith('Bought ')", DASHBOARD_HTML)
+        self.assertIn("Number(trade.open_positions||0)<=0", DASHBOARD_HTML)
+        self.assertIn("manualTicket.notice=''", DASHBOARD_HTML)
+
+    def test_dashboard_html_shows_manual_position_cost_basis(self):
+        self.assertIn("manualPositionSummary", DASHBOARD_HTML)
+        self.assertIn("manualPositionShares", DASHBOARD_HTML)
+        self.assertIn("manualAvgCost", DASHBOARD_HTML)
+        self.assertIn("manualPositionCost", DASHBOARD_HTML)
+        self.assertIn("manualPositionPnl", DASHBOARD_HTML)
+        self.assertIn("renderManualPositionSummary", DASHBOARD_HTML)
+        self.assertIn("position_average_price", DASHBOARD_HTML)
+        self.assertIn("Cost basis", DASHBOARD_HTML)
 
     def test_dashboard_html_uses_english_ui_copy(self):
         self.assertIn("Run bot", DASHBOARD_HTML)
@@ -1203,7 +1380,7 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("performanceRow.append(presetPanel,healthPanel)", DASHBOARD_HTML)
         self.assertIn("manualRow.append(manualTicketEl,journalPanel)", DASHBOARD_HTML)
         self.assertIn("tradesRow.append(marketPanel,outcomePanel)", DASHBOARD_HTML)
-        self.assertIn("organizeDashboardLayout();updatePresetRisk();refresh()", DASHBOARD_HTML)
+        self.assertIn("labelOverviewRecentTrades();organizeDashboardLayout();updatePresetRisk();refresh()", DASHBOARD_HTML)
 
     def test_dashboard_payload_includes_active_position_unrealized_pnl(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1292,6 +1469,163 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(bot_rows, [])
             self.assertEqual(len(manual_positions), 1)
             self.assertEqual(bot_positions, [])
+
+    def test_manual_trade_averages_cost_basis_across_buys_sells_and_settlement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            market_slug = "btc-updown-5m-average"
+            write_market_context(
+                db_path,
+                {
+                    "slug": market_slug,
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() + 120,
+                    "status": "active",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                price = paper_bot.PriceSnapshot(76950.0, timestamp_ms=1, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_050, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Up",
+                    "up-token",
+                    BookTop(bid=0.76, bid_size=90, ask=0.78, ask_size=80, last=0.77, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    price,
+                    clock,
+                    42,
+                )
+            finally:
+                con.close()
+
+            first_buy = paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 0.78})
+            self.assertAlmostEqual(first_buy["shares"], 1.0)
+
+            con = init_db(db_path)
+            try:
+                price = paper_bot.PriceSnapshot(76960.0, timestamp_ms=2, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_080, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Up",
+                    "up-token",
+                    BookTop(bid=0.54, bid_size=90, ask=0.56, ask_size=80, last=0.55, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    price,
+                    clock,
+                    30,
+                )
+            finally:
+                con.close()
+
+            second_buy = paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 1.12})
+            self.assertAlmostEqual(second_buy["shares"], 2.0)
+
+            expected_cost = 1.90
+            expected_shares = 3.0
+            expected_average = expected_cost / expected_shares
+            payload = dashboard_payload(db_path)
+            manual_up = next(row for row in payload["manual_trade"]["outcomes"] if row["outcome"] == "Up")
+            self.assertAlmostEqual(manual_up["position_shares"], expected_shares)
+            self.assertAlmostEqual(manual_up["position_size_usd"], expected_cost)
+            self.assertAlmostEqual(manual_up["position_entry_price"], expected_average)
+            self.assertAlmostEqual(manual_up["position_average_price"], expected_average)
+
+            con = init_db(db_path)
+            try:
+                price = paper_bot.PriceSnapshot(76980.0, timestamp_ms=3, received_ms=paper_bot.now_ms(), source="test")
+                clock = ClockSnapshot(unix_ts=1_100, source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Up",
+                    "up-token",
+                    BookTop(bid=0.70, bid_size=90, ask=0.72, ask_size=80, last=0.71, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    price,
+                    clock,
+                    20,
+                )
+            finally:
+                con.close()
+
+            sell = paper_bot.manual_trade(db_path, {"side": "sell", "outcome": "Up", "percent": 50})
+            self.assertAlmostEqual(sell["shares"], 1.5)
+            self.assertAlmostEqual(sell["size_usd"], 0.95)
+            self.assertAlmostEqual(sell["pnl"], 0.10)
+            self.assertAlmostEqual(sell["remaining_shares"], 1.5)
+
+            payload = dashboard_payload(db_path)
+            manual_up = next(row for row in payload["manual_trade"]["outcomes"] if row["outcome"] == "Up")
+            self.assertAlmostEqual(manual_up["position_shares"], 1.5)
+            self.assertAlmostEqual(manual_up["position_size_usd"], 0.95)
+            self.assertAlmostEqual(manual_up["position_average_price"], expected_average)
+            self.assertAlmostEqual(payload["manual_trade"]["closed_pnl"], 0.10)
+
+            write_market_context(
+                db_path,
+                {
+                    "slug": market_slug,
+                    "title": "BTC Up or Down 5m",
+                    "target_price": 77000.0,
+                    "resolution_source": "https://data.chain.link/streams/btc-usd",
+                    "start_ts": 1_000,
+                    "end_ts": paper_bot.utc_now() - 1,
+                    "status": "closed",
+                },
+            )
+            con = init_db(db_path)
+            try:
+                final_price = paper_bot.PriceSnapshot(77123.0, timestamp_ms=4, received_ms=paper_bot.now_ms(), source="test")
+                final_clock = ClockSnapshot(unix_ts=paper_bot.utc_now(), source="polymarket", synced_age_seconds=1)
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Up",
+                    "up-token",
+                    BookTop(bid=1.0, bid_size=10, ask=1.0, ask_size=0, last=1.0, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    final_price,
+                    final_clock,
+                    0,
+                )
+                paper_bot.write_latest_state(
+                    con,
+                    market_slug,
+                    "Down",
+                    "down-token",
+                    BookTop(bid=0.0, bid_size=0, ask=0.0, ask_size=0, last=0.0, raw={}, updated_ms=paper_bot.now_ms(), source="test"),
+                    final_price,
+                    final_clock,
+                    0,
+                )
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+            self.assertEqual(payload["manual_trade"]["open_positions"], 0)
+            self.assertAlmostEqual(payload["manual_trade"]["closed_pnl"], 0.65)
+            con = init_db(db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                manual_rows = con.execute(
+                    "SELECT exit_price, shares, size_usd, pnl, exit_reason FROM manual_trades ORDER BY id"
+                ).fetchall()
+            finally:
+                con.close()
+            self.assertEqual(len(manual_rows), 2)
+            self.assertAlmostEqual(manual_rows[0]["shares"], 1.5)
+            self.assertAlmostEqual(manual_rows[0]["size_usd"], 0.95)
+            self.assertAlmostEqual(manual_rows[0]["pnl"], 0.10)
+            self.assertEqual(manual_rows[0]["exit_reason"], "manual_sell:50%")
+            self.assertAlmostEqual(manual_rows[1]["exit_price"], 1.0)
+            self.assertAlmostEqual(manual_rows[1]["shares"], 1.5)
+            self.assertAlmostEqual(manual_rows[1]["size_usd"], 0.95)
+            self.assertAlmostEqual(manual_rows[1]["pnl"], 0.55)
+            self.assertEqual(manual_rows[1]["exit_reason"], "manual_settle:up")
 
     def test_manual_trade_rejects_buy_when_selected_side_is_100_cents(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1411,7 +1745,7 @@ class StrategyTests(unittest.TestCase):
             self.assertEqual(manual_state["open_positions"], 0)
             self.assertEqual(manual_state["trades"], 1)
             self.assertAlmostEqual(manual_state["closed_pnl"], bought_shares - 2)
-            self.assertAlmostEqual(manual_state["available_budget_usd"], manual_state["budget_usd"])
+            self.assertAlmostEqual(manual_state["available_budget_usd"], manual_state["budget_usd"] + manual_state["closed_pnl"])
 
             con = init_db(db_path)
             con.row_factory = sqlite3.Row
@@ -1507,19 +1841,33 @@ class StrategyTests(unittest.TestCase):
 
             sell = paper_bot.manual_trade(db_path, {"side": "sell", "outcome": "Up", "percent": 50})
             self.assertTrue(sell["ok"])
+            first_loss = sell["pnl"]
 
             payload = dashboard_payload(db_path)
             manual_state = payload["manual_trade"]
             self.assertEqual(manual_state["budget_usd"], 3.0)
             self.assertAlmostEqual(manual_state["open_size_usd"], 1.0)
-            self.assertAlmostEqual(manual_state["available_budget_usd"], 2.0)
+            self.assertAlmostEqual(manual_state["available_budget_usd"], 2.0 + first_loss)
             self.assertLess(manual_state["total_pnl"], 0)
             self.assertEqual(payload["overall"]["pnl"], 0.0)
             self.assertEqual(payload["overall"]["active_unrealized_pnl"], 0.0)
 
+            second_sell = paper_bot.manual_trade(db_path, {"side": "sell", "outcome": "Up", "percent": 100})
+            self.assertTrue(second_sell["ok"])
+            total_closed_pnl = first_loss + second_sell["pnl"]
+
+            payload = dashboard_payload(db_path)
+            manual_state = payload["manual_trade"]
+            self.assertAlmostEqual(manual_state["open_size_usd"], 0.0)
+            self.assertAlmostEqual(manual_state["available_budget_usd"], 3.0 + total_closed_pnl)
+            self.assertLess(manual_state["available_budget_usd"], 3.0)
+            with self.assertRaisesRegex(ValueError, "Manual budget"):
+                paper_bot.manual_trade(db_path, {"side": "buy", "outcome": "Up", "amount_usd": 3})
+
             reset_payload = paper_bot.manual_pnl_reset(db_path)
             self.assertAlmostEqual(reset_payload["manual_trade"]["total_pnl"], 0.0)
             self.assertAlmostEqual(reset_payload["manual_trade"]["budget_usd"], 3.0)
+            self.assertAlmostEqual(reset_payload["manual_trade"]["available_budget_usd"], 3.0 + total_closed_pnl)
 
     def test_dashboard_payload_includes_market_reference_prices(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1822,6 +2170,107 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(payload["trades"][0]["preset_key"], "aggressive")
         self.assertIn("preset_name", payload["preset_equity"][0])
 
+    def test_dashboard_payload_returns_all_auto_trade_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                auto_cfg = cfg(label="test-market Up preset:safe", preset_key="safe", preset_name="Safe")
+                for index in range(275):
+                    paper_bot.record_trade(
+                        con,
+                        auto_cfg,
+                        PaperPosition(
+                            entry_ts=1_000 + index,
+                            entry_price=0.50,
+                            shares=2.0,
+                            size_usd=1.0,
+                            reason=f"entry:{index}",
+                        ),
+                        0.60,
+                        "take_profit",
+                    )
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertEqual(payload["overall"]["trades"], 275)
+        self.assertEqual(len(payload["trades"]), 275)
+
+    def test_dashboard_payload_exposes_manual_trades_separately_from_auto_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                auto_cfg = cfg(label="auto-market Up preset:safe", preset_key="safe", preset_name="Safe")
+                paper_bot.record_trade(
+                    con,
+                    auto_cfg,
+                    PaperPosition(entry_ts=1_000, entry_price=0.50, shares=2.0, size_usd=1.0, reason="auto_entry"),
+                    0.60,
+                    "take_profit",
+                )
+                manual_cfg = paper_bot.manual_trade_config("manual-token", "manual-market", "Up")
+                paper_bot.record_manual_trade(
+                    con,
+                    manual_cfg,
+                    PaperPosition(entry_ts=1_010, entry_price=0.56, shares=2.0, size_usd=1.12, reason="manual_buy"),
+                    0.50,
+                    "manual_sell:100%",
+                )
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        self.assertEqual(payload["overall"]["trades"], 1)
+        self.assertEqual(len(payload["trades"]), 1)
+        self.assertEqual(len(payload["manual_trades"]), 1)
+        self.assertEqual(payload["manual_trades"][0]["preset_key"], "manual")
+        self.assertEqual(payload["manual_trades"][0]["preset_name"], "Manual")
+        self.assertEqual(payload["manual_trades"][0]["market_slug"], "manual-market")
+
+    def test_dashboard_payload_ranks_presets_for_research(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "paper.sqlite"
+            con = init_db(db_path)
+            try:
+                safe_cfg = cfg(label="test-market Up preset:safe", preset_key="safe", preset_name="Safe")
+                balanced_cfg = cfg(label="test-market Down preset:balanced", preset_key="balanced", preset_name="Balanced")
+                paper_bot.record_trade(
+                    con,
+                    safe_cfg,
+                    PaperPosition(entry_ts=1_000, entry_price=0.50, shares=2.0, size_usd=1.0, reason="entry"),
+                    0.60,
+                    "take_profit",
+                )
+                paper_bot.record_trade(
+                    con,
+                    safe_cfg,
+                    PaperPosition(entry_ts=1_010, entry_price=0.50, shares=2.0, size_usd=1.0, reason="entry"),
+                    0.45,
+                    "stop_loss",
+                )
+                paper_bot.record_trade(
+                    con,
+                    balanced_cfg,
+                    PaperPosition(entry_ts=1_020, entry_price=0.50, shares=2.0, size_usd=1.0, reason="entry"),
+                    0.70,
+                    "take_profit",
+                )
+            finally:
+                con.close()
+
+            payload = dashboard_payload(db_path)
+
+        by_preset = {row["preset_key"]: row for row in payload["preset_summary"]}
+        self.assertAlmostEqual(by_preset["safe"]["profit_factor"], 2.0)
+        self.assertAlmostEqual(by_preset["safe"]["max_drawdown"], 0.1)
+        self.assertAlmostEqual(by_preset["safe"]["stop_loss_rate"], 50.0)
+        self.assertTrue(by_preset["balanced"]["profit_factor_infinite"])
+        self.assertEqual(payload["preset_rankings"][0]["preset_key"], "balanced")
+
     def test_dashboard_payload_includes_run_metadata_and_db_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "run.sqlite"
@@ -1866,12 +2315,14 @@ class StrategyTests(unittest.TestCase):
                 "url": "btc-updown-5m-1",
                 "max_trades_per_label_per_market": "2",
                 "market_lock_after_loss": "false",
+                "loss_lock_scope": "none",
                 "no_entry_after_seconds": "240",
                 "max_sum_asks": "1.02",
             }
         )
         self.assertEqual(config["max_trades_per_label_per_market"], 2)
         self.assertFalse(config["market_lock_after_loss"])
+        self.assertEqual(config["loss_lock_scope"], "none")
         self.assertEqual(config["no_entry_after_seconds"], 240)
         self.assertEqual(config["max_sum_asks"], 1.02)
 
